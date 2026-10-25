@@ -1,0 +1,8 @@
+id: deepseek-harness
+name: DeepSeek Harness（headless）
+command: /path/to/collab-desk/协作/agents/bin/deepseek-harness.sh
+args_template: '"{prompt}"'
+cwd: /path/to/collab-desk
+installed: true
+version: 0.2.1-rc.2 (com.deepseek.dsh)
+notes: '★ 已实测可用（2026-10-24，1.4s 返回"可用"）。走 bundle 内 dsh --profile headless；密钥由适配器从环境变量 DEEPSEEK_API_KEY 读取。支持 "-" 从 stdin 读任务、--json 事件流、--session-id 续会话。桌面 GUI 的 desktop profile 仍由 Electron 独占，不可命令行调用。'

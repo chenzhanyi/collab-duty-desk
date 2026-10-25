@@ -1,0 +1,8 @@
+id: demo-dispatch
+name: T10 演示分发 Agent
+command: /path/to/collab-desk/项目/T11_演示-分发串行/工作区/demo-agent.py
+args_template: '"{prompt}"'
+cwd: /path/to/collab-desk
+installed: true
+version: demo (T10 verification only)
+notes: 'T10 验收夹具，保留供复核：sleep 3 秒并写 子任务/<id>/DONE.md；仅被 demo-* 角色绑定。'

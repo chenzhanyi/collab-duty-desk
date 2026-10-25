@@ -1,0 +1,9 @@
+id: designer-ds
+name: 设计师 · DS
+description: 由 claude-ds 承担设计执行；本期仅保存角色与绑定配置。
+agent_id: deepseek-harness
+write_scope:
+  - 项目/*/工作区/**
+  - 项目/*/对接/交付/**
+enabled: true
+notes: ""

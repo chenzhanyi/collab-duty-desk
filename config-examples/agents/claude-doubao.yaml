@@ -1,0 +1,8 @@
+id: claude-doubao
+name: Claude Doubao（订阅已过期）
+command: /path/to/bin/claude-doubao
+args_template: '-p "{prompt}"'
+cwd: /path/to/collab-desk
+installed: true
+version: 2.1.170 (Claude Code)
+notes: '★ 暂不可用：2026-10-24 实测返回 400「CodingPlan subscription invalid/expired」。续订后即可用。'

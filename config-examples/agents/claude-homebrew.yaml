@@ -1,0 +1,8 @@
+id: claude-homebrew
+name: Claude Code (上游 2.1.292)
+command: /usr/local/bin/claude
+args_template: '-p "{prompt}"'
+cwd: /path/to/collab-desk
+installed: true
+version: 2.1.292 (Claude Code)
+notes: '本机上游 Claude Code CLI；调用方式与 claude-ds 类似（-p 传提示词）。'

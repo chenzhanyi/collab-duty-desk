@@ -1,0 +1,8 @@
+id: openclaw-reviewer
+name: OpenClaw · reviewer (独立审查)
+command: /path/to/bin/openclaw
+args_template: 'agent exec "{prompt}" --json --timeout 600 --model deepseek/deepseek-flash'
+cwd: $HOME/.openclaw/agents/reviewer/workspace
+installed: true
+version: OpenClaw 2026.9.4
+notes: 'T13 修正：openclaw 的 exec 子命令不接受 --agent（实测 2026-10-24 报不识别），改用与 openclaw-main 相同的显式 deepseek-flash 模型；审核身份由固定提示词约束。适合做第二意见/独立复核。'

@@ -1,0 +1,7 @@
+id: designer
+name: 前端设计师
+description: 负责方案与界面设计，按绑定的 Agent 应用产出设计交付。
+agent_id: openclaw-main
+write_scope: []
+enabled: true
+notes: 首次运行生成的默认角色；可按需修改。

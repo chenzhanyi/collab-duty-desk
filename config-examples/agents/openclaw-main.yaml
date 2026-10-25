@@ -1,0 +1,8 @@
+id: openclaw-main
+name: OpenClaw · Jarvis (main)
+command: /path/to/bin/openclaw
+args_template: 'agent exec "{prompt}" --json --timeout 600 --model deepseek/deepseek-flash'
+cwd: $HOME/.openclaw/workspace
+installed: true
+version: OpenClaw 2026.9.4
+notes: '走本地 Gateway 127.0.0.1:18789（token 鉴权）。实测 2026-10-24：agent exec 用位置参数传提示词；必须显式 --model deepseek/deepseek-flash（默认模型指向 LM Studio，当前连接被拒）。'

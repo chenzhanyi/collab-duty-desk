@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+.DS_Store
+desktop/build/
+console/验收记录.md
+项目/
+归档/
+协作/调度台/

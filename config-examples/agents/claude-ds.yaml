@@ -1,0 +1,8 @@
+id: claude-ds
+name: Claude DS（DeepSeek harness）
+command: /path/to/bin/claude-ds
+args_template: '-p "{prompt}" --permission-mode acceptEdits --allowedTools "Read,Edit,Write,Glob,Grep,Bash"'
+cwd: /path/to/collab-desk
+installed: true
+version: 2.1.170 (Claude Code)
+notes: '★ DeepSeek 引擎。调用：claude-ds -p "<提示词>" --permission-mode acceptEdits --allowedTools ...；必须 </dev/null 防等 stdin 卡死。实测 2026-10-24 可用。'

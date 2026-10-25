@@ -1,0 +1,7 @@
+id: controller
+name: 总控
+description: 统筹任务分派、协作节奏与角色路由；本期只保存配置，不触发调用。
+agent_id: openclaw-main
+write_scope: []
+enabled: true
+notes: ""
