@@ -49,7 +49,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, urlsplit
 
-import runner as runner_engine
+try:  # 包导入（python3 -c "import console.server"）与脚本运行都可用
+    from . import runner as runner_engine
+except ImportError:  # pragma: no cover - 直接运行 console/server.py 时走这里
+    import runner as runner_engine
 
 # ---------------------------------------------------------------------------
 # 路径固定；命令行只覆盖测试端口与执行器超时，服务始终只绑定 127.0.0.1

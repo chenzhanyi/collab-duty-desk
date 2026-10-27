@@ -31,6 +31,33 @@ python3 console/server.py
 
 打开 <http://127.0.0.1:8787>。
 
+## 全新克隆如何跑
+
+公开仓库只纳入运行所需脚本，不含 `watch.state / journal.log / guard.status / snapshots`
+等运行态。全新克隆后按下面顺序执行：
+
+```bash
+git clone https://github.com/chenzhanyi/collab-duty-desk.git
+cd collab-duty-desk
+
+# 0) 可选：在临时目录做一次全新克隆自检（构建 .app + 三个运行脚本 + 导入控制台）
+bash scripts/check-fresh-clone.sh
+
+# 1) 准备角色与 Agent 配置
+mkdir -p 协作/roles 协作/agents
+cp config-examples/roles/*.yaml  协作/roles/
+cp config-examples/agents/*.yaml 协作/agents/
+
+# 2) 启动控制台（或先构建菜单栏应用，由它托管控制台与守卫）
+python3 console/server.py
+# 可选：bash desktop/build.sh && open desktop/build/CollabMenuBar.app
+```
+
+`scripts/check-fresh-clone.sh` 会在 `mktemp -d` 的临时目录中复制仓库、执行
+`bash desktop/build.sh`，并断言 `.app` 主程序可执行、`desktop/runner.sh`、
+`协作/调度台/watch.sh`、`协作/调度台/ack.sh` 存在且可执行、`import console.server`
+成功；源仓库不会被修改。
+
 ## 目录约定
 
 ```text
