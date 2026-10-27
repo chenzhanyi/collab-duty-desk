@@ -42,7 +42,13 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
+
+try:  # 仅用于跨进程的任务生命周期锁；不可用时退化为进程内锁。
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows 无 fcntl
+    fcntl = None  # type: ignore
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -76,6 +82,8 @@ DONE_NAME = "DONE.md"
 IDEA_NAME = "idea.md"
 SUBTASKS_NAME = "subtasks.yaml"
 REGISTER_DONE_NAME = "登记完成.md"
+HISTORY_DIRNAME = "历史"
+SUBTASK_HISTORY_DIRNAME = "子任务"
 
 DISPATCH_DIR = COLLAB_DIR / "调度台"
 ROLES_DIR = COLLAB_DIR / "roles"
@@ -223,6 +231,7 @@ ADVANCE_STATE_NAMES = {
     "running": "推进中",
     "completed": "推进完成",
     "stopped": "已停止",
+    "stopped_with_budget": "预算用尽已停止",
     "failed": "推进失败",
     "handoff_blocked": "交接阻塞",
 }
@@ -231,6 +240,7 @@ ADVANCE_STATE_TONES = {
     "running": "running",
     "completed": "passed",
     "stopped": "revise",
+    "stopped_with_budget": "revise",
     "failed": "failed",
     "handoff_blocked": "failed",
 }
@@ -244,21 +254,43 @@ ADVANCE_STEP_LABELS = {
 ADVANCE_TERMINAL_STATES = {
     "completed",
     "stopped",
+    "stopped_with_budget",
     "failed",
     "handoff_blocked",
 }
+
+# 全自动推进预算：默认 2 小时 / 12 个子任务 / 3 轮修订；
+# 可用环境变量或 server.py 命令行参数覆盖。测试直接改这些模块常量。
+ADVANCE_MAX_RUNTIME_SECONDS = float(
+    os.environ.get("COLLAB_ADVANCE_MAX_RUNTIME_SECONDS", "7200")
+)
+ADVANCE_MAX_SUBTASKS = int(
+    os.environ.get("COLLAB_ADVANCE_MAX_SUBTASKS", "12")
+)
+ADVANCE_MAX_REVISE_ROUNDS = int(
+    os.environ.get("COLLAB_ADVANCE_MAX_REVISE_ROUNDS", "3")
+)
 
 # 继续修正（重修）：须修正 → 重置受影响子任务 → 自动分发 → 自动审核。
 MAX_REVISE_ROUNDS = 3
 REVISE_MODE_AFFECTED = "affected"
 REVISE_MODE_ALL = "all"
 REVISE_MODE_REVIEW = "review"
-REVISE_MODES = (REVISE_MODE_AFFECTED, REVISE_MODE_ALL, REVISE_MODE_REVIEW)
+REVISE_MODE_WHOLE = "whole"
+REVISE_MODES = (
+    REVISE_MODE_AFFECTED,
+    REVISE_MODE_ALL,
+    REVISE_MODE_REVIEW,
+    REVISE_MODE_WHOLE,
+)
 REVISE_MODE_LABELS = {
     REVISE_MODE_AFFECTED: "只重做问题清单涉及的子任务",
     REVISE_MODE_ALL: "全部子任务重做",
     REVISE_MODE_REVIEW: "只重新审核（不改产物）",
+    REVISE_MODE_WHOLE: "整单重修（回叫 owner_role 重做整单）",
 }
+DEFAULT_OWNER_ROLE = "designer"
+TASK_LIFECYCLE_LOCK_TIMEOUT_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # 状态
@@ -286,24 +318,234 @@ STATUS_DISPLAY_ORDER = (
 )
 
 
-def _review_verdict(text: str) -> str:
-    """从 审查.md 提取结论；优先结论行，其次全文关键词。
+_REVIEW_CONCLUSION_LABEL_RE = re.compile(
+    r"^\s*(?:[-*+]\s+)?(?:\*\*)?(?:审查)?结论(?:\*\*)?\s*[：:]\s*(.*)$"
+)
+# 兼容历史报告把“**结论**：”写在“**审查时间**：”同一行的格式；
+# 要求标签前是空白，避免误命中行内代码里被引用的 `**结论**：`。
+_REVIEW_INLINE_CONCLUSION_RE = re.compile(
+    r"(?<=\s)\*\*(?:审查)?结论\*\*\s*[：:]\s*(.*)$"
+)
+_REVIEW_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+# 围栏代码块（``` / ~~~）。围栏内的示例、模板或旧报告引用不参与结论判定。
+_REVIEW_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+# 标题序号（“三、”“3.”“（一）”“第 3 节”等）；规范化后判断标题是否为结论标题。
+_REVIEW_HEADING_ORDINAL_RE = re.compile(
+    r"^(?:"
+    r"[（(][一二三四五六七八九十百零〇\d]+[）)]"
+    r"|[一二三四五六七八九十百零〇]+[、.．]"
+    r"|\d+[、.．)）]"
+    r"|第\s*[一二三四五六七八九十百零〇\d]+\s*[章节部分]?[、.．：:]?"
+    r")\s*"
+)
+# 结论里的否定短语（“无须修正”“全部通过，无不通过项”）不是修正结论；
+# 取词前先剔除，避免“须修正/不通过”的子串误伤。只匹配带否定前缀的短语，
+# 裸“不通过/未通过”仍按修正处理。
+_REVIEW_NEGATED_REVISE_RE = re.compile(
+    r"(?:没有|并无|不存在|未发现|未见|无|不)\s*"
+    r"(?:任何|其它|其他)?\s*"
+    r"(?:须修正|需修正|不通过|未通过)"
+    r"(?:项|的情况|问题|之处)?"
+)
+# 在明确结论来源内按语义优先级取词，而非字符位置：否定/修正词优先，
+# 其次待定类，最后才看通过。这样“通过与否待定”不会被较早的“通过”
+# 覆盖，“通过，但须修正”也不会误判为 passed。
+_REVIEW_VERDICT_TERMS = (
+    (("须修正", "不通过", "未通过", "not passed", "revise"), "revise"),
+    (("待定", "不确定", "待议"), ""),
+    (("通过", "passed"), "passed"),
+)
 
-    “不通过”必须先于“通过”判定，否则带有否定语的审查会被误判为通过。
+# 审核署名：新审查必须在头部声明审核角色与 Agent；出现 AI-A 字样视为冒名。
+_REVIEW_ROLE_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?审核角色[ \t]*[：:][ \t]*(.+?)[ \t]*$",
+    re.MULTILINE,
+)
+_REVIEW_TIME_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*+][ \t]+)?审查时间[ \t]*[：:][ \t]*\S",
+    re.MULTILINE,
+)
+_REVIEW_AGENT_PAREN_RE = re.compile(r"[（(]\s*([^（）()]+?)\s*[）)]\s*$")
+_REVIEW_IMPERSONATION_RE = re.compile(r"AI\s*[-–—－]\s*A", re.IGNORECASE)
+REVIEW_ATTRIBUTION_HISTORY_PREFIX = "invalid-attribution"
+# T24 起的新审查必须署名；早于此刻的既有 审查.md 按旧规则判定。
+# 可用环境变量覆盖，便于隔离测试/迁移；默认值取 T24 任务创建时间。
+REVIEW_ATTRIBUTION_SINCE = os.environ.get(
+    "COLLAB_REVIEW_ATTRIBUTION_SINCE", "2026-10-27T02:51:29-04:00"
+)
+try:
+    REVIEW_ATTRIBUTION_SINCE_EPOCH = datetime.fromisoformat(
+        REVIEW_ATTRIBUTION_SINCE
+    ).timestamp()
+except ValueError:
+    REVIEW_ATTRIBUTION_SINCE_EPOCH = 0.0
+
+
+def _review_attribution_header(
+    role_name: str, agent_id: str, *, when: str = ""
+) -> str:
+    """返回可原样照抄的署名两行；结论行由审核 Agent 按实际结论另写。"""
+    return (
+        f"- 审核角色：{role_name}（{agent_id}）\n"
+        f"- 审查时间：{when or _now_iso()}\n"
+    )
+
+
+def _review_attribution_required(
+    task: Task, state: Dict[str, object]
+) -> bool:
+    """新审查需要署名：本次 review 状态标记，或文件晚于 T24 起算点。"""
+    if state.get("attribution_required"):
+        return True
+    if task.review_path is None:
+        return False
+    try:
+        return task.review_path.stat().st_mtime >= REVIEW_ATTRIBUTION_SINCE_EPOCH
+    except OSError:
+        return False
+
+
+def _review_attribution_issue(
+    text: str, state: Dict[str, object]
+) -> str:
+    """校验新审查的头部署名；返回空串表示通过。
+
+    仅对带 `attribution_required` 的新审查调用；历史审查不套用新规则。
+    AI-A 字样在全篇任意位置出现都拒收（防止执行方自称 AI-A 通过）。
+    """
+    if not text.strip():
+        return "missing"
+    if _REVIEW_IMPERSONATION_RE.search(text):
+        return "impersonation"
+    header = "\n".join(text.splitlines()[:40])
+    role_match = _REVIEW_ROLE_LINE_RE.search(header)
+    if role_match is None:
+        return "missing_role"
+    if _REVIEW_TIME_LINE_RE.search(header) is None:
+        return "missing_time"
+    role_value = role_match.group(1).strip()
+    paren = _REVIEW_AGENT_PAREN_RE.search(role_value)
+    if paren is None:
+        return "missing_agent"
+    header_role = role_value[: paren.start()].strip().rstrip("：: -—").strip()
+    header_agent = paren.group(1).strip()
+    expected_agent = str(
+        state.get("attribution_agent") or state.get("agent") or ""
+    ).strip()
+    expected_role = str(
+        state.get("attribution_role_name") or state.get("role_name") or ""
+    ).strip()
+    if expected_agent and header_agent != expected_agent:
+        return "wrong_agent"
+    if expected_role and header_role != expected_role:
+        return "wrong_role"
+    return ""
+
+
+def _review_attribution_message(issue: str) -> str:
+    return {
+        "impersonation": "审查中出现 AI-A 冒名字样，已拒收并隔离",
+        "missing": "审查为空，未署名",
+        "missing_role": "审查头部缺少「审核角色：」",
+        "missing_time": "审查头部缺少「审查时间：」",
+        "missing_agent": "审核角色未按「角色名（Agent ID）」格式署名",
+        "wrong_agent": "审核角色署名的 Agent 与本次绑定不一致",
+        "wrong_role": "审核角色署名与本次绑定角色不一致",
+    }.get(issue, "审查署名无效")
+
+
+def _review_strip_code_fences(text: str) -> str:
+    """去掉 Markdown 围栏代码块；支持 ``` 与 ~~~，未闭合围栏视为到文末。"""
+    kept: List[str] = []
+    fence: Optional[Tuple[str, int]] = None
+    for raw_line in text.splitlines():
+        match = _REVIEW_FENCE_RE.match(raw_line)
+        if fence is not None:
+            if (
+                match is not None
+                and match.group(1)[0] == fence[0]
+                and len(match.group(1)) >= fence[1]
+                and not match.group(2).strip()
+            ):
+                fence = None
+            continue
+        if match is not None:
+            fence = (match.group(1)[0], len(match.group(1)))
+            continue
+        kept.append(raw_line)
+    return "\n".join(kept)
+
+
+def _review_is_conclusion_heading(title: str) -> bool:
+    """判断标题是否为结论标题：规范化后等于「结论」或以「结论」结尾。"""
+    normalized = title.strip()
+    bold = re.fullmatch(r"\*\*(.+?)\*\*", normalized)
+    if bold:
+        normalized = bold.group(1).strip()
+    normalized = _REVIEW_HEADING_ORDINAL_RE.sub("", normalized).strip()
+    return normalized == "结论" or normalized.endswith("结论")
+
+
+def _review_conclusion_verdict(source: str) -> str:
+    """只在明确结论来源内按语义优先级映射枚举词；待定/不可识别返回空。"""
+    haystack = _REVIEW_NEGATED_REVISE_RE.sub("", source.lower())
+    for terms, verdict in _REVIEW_VERDICT_TERMS:
+        if any(term in haystack for term in terms):
+            return verdict
+    return ""
+
+
+def _review_verdict(text: str) -> str:
+    """从 审查.md 的明确结论来源提取结论。
+
+    来源优先级：先全篇扫描显式 `结论：` / `**结论**：` 行（含
+    `- **结论**：` 与同行 `**审查时间**：… **结论**：…`），取第一个非空
+    来源；只有不存在非空显式行时，才回退到标题段落。标题段落仅接受
+    level ≥ 2（排除 H1 文档标题），且标题去掉序号（`三、`、`3.`、
+    `（一）` 等）后必须等于「结论」或以「结论」结尾；`结论解析`、
+    `结论与建议` 等叙述性标题不作为来源。
+
+    来源内按「修正 > 待定 > 通过」的语义优先级映射枚举值（取词前剔除
+    “无须修正/无不通过项”等否定短语）。待定、空或没有明确结论来源时
+    返回 ""，不得回退到全文关键词，避免“结论待定但正文提到通过”被判为
+    passed。围栏代码块中的示例先被剔除；空的结论标签会跳过并继续扫描
+    后续来源。
     """
     if not text:
         return ""
-    for line in text.splitlines():
-        if "结论" not in line:
+    lines = _review_strip_code_fences(text).splitlines()
+    # A) 显式结论行优先：全篇取第一个非空来源，标题段落不得覆盖。
+    for raw_line in lines:
+        line = raw_line.strip()
+        label = _REVIEW_CONCLUSION_LABEL_RE.match(line)
+        if label:
+            source = label.group(1).strip()
+        else:
+            inline_label = _REVIEW_INLINE_CONCLUSION_RE.search(line)
+            source = inline_label.group(1).strip() if inline_label else ""
+        if not source:
             continue
-        if "须修正" in line or "不通过" in line or "未通过" in line:
-            return "revise"
-        if "通过" in line:
-            return "passed"
-    if "须修正" in text or "不通过" in text or "未通过" in text:
-        return "revise"
-    if "通过" in text:
-        return "passed"
+        return _review_conclusion_verdict(source)
+    # B) 标题来源收窄：仅 level ≥ 2 且标题本身是“结论”。
+    for index, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        heading = _REVIEW_HEADING_RE.match(line)
+        if heading is None:
+            continue
+        level = len(heading.group(1))
+        if level < 2 or not _review_is_conclusion_heading(heading.group(2)):
+            continue
+        body: List[str] = []
+        for following in lines[index + 1:]:
+            stripped = following.strip()
+            next_heading = _REVIEW_HEADING_RE.match(stripped)
+            if next_heading and len(next_heading.group(1)) <= level:
+                break
+            body.append(stripped)
+        source = "\n".join(body)
+        if not source.strip():
+            continue
+        return _review_conclusion_verdict(source)
     return ""
 
 
@@ -448,6 +690,7 @@ FORM_FIELDS = (
     "acceptance",
     "prohibitions",
     "workdir",
+    "owner_role",
     "idea",
     "auto_advance",
     "mode",
@@ -470,9 +713,11 @@ TASK_META_KEYS = (
     "subtask_count",
     "auto_advance",
     "revise_round",
+    "owner_role",
 )
 PROJECT_NAME_RE = re.compile(r"^(T\d+)(?:_([^/]*))?$", re.IGNORECASE)
 TASK_ID_RE = re.compile(r"^T\d+$", re.IGNORECASE)
+SUBTASK_ID_RE = re.compile(r"^T\d+-\d+$", re.IGNORECASE)
 CONFIG_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 TEXT_FILE_SUFFIXES = {".md", ".markdown", ".txt", ".log", ".json", ".csv", ".tsv", ".py", ".sh"}
 
@@ -498,6 +743,9 @@ DEFAULT_ROLE_SPECS = (
 TASK_WRITE_LOCK = threading.Lock()
 PROJECT_MOVE_LOCK = threading.Lock()
 CONFIG_WRITE_LOCK = threading.Lock()
+TASK_LIFECYCLE_LOCKS: Dict[str, threading.RLock] = {}
+TASK_LIFECYCLE_LOCKS_GUARD = threading.Lock()
+TASK_LIFECYCLE_STATE = threading.local()
 REGISTRATION_START_LOCK = threading.Lock()
 ACTIVE_REGISTRATIONS: set[str] = set()
 DISPATCH_START_LOCK = threading.Lock()
@@ -561,6 +809,80 @@ class ConfigError(ValueError):
     """角色/Agent YAML 配置无法读取或字段不合法。"""
 
 
+def _task_lifecycle_lock_path(task_id: str) -> Path:
+    return DISPATCH_DIR / ".locks" / f"task-{task_id.upper()}.lock"
+
+
+def _acquire_task_lock_file(task_id: str):
+    """跨进程文件锁；不可用或目录不可写时退化为进程内锁。"""
+    if fcntl is None:
+        return None
+    path = _task_lifecycle_lock_path(task_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+")
+    except OSError:
+        return None
+    deadline = time.monotonic() + TASK_LIFECYCLE_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise ActionError(
+                    409,
+                    "任务正在切换状态",
+                    f"{task_id} 正被另一个控制台进程移动或启动，本次没有执行任何操作。",
+                    "等待当前归档/恢复/分发启动结束后重试。",
+                )
+            time.sleep(0.05)
+        except OSError:
+            handle.close()
+            return None
+
+
+@contextmanager
+def _task_lifecycle_lock(task_id: str):
+    """按任务串行化「校验 + 预占 + move/launch」。
+
+    只覆盖归档/恢复、改 workdir、启动分发/审核/修订/推进的临界区，
+    不覆盖 Agent 随后的运行期。同一线程嵌套获取时复用最外层文件锁。
+    """
+    tid = str(task_id or "").strip().upper()
+    if not TASK_ID_RE.fullmatch(tid):
+        raise ActionError(400, "任务编号不合法", f"{task_id!r} 不是有效的任务编号。")
+    with TASK_LIFECYCLE_LOCKS_GUARD:
+        lock = TASK_LIFECYCLE_LOCKS.setdefault(tid, threading.RLock())
+    depth = int(getattr(TASK_LIFECYCLE_STATE, "depth", 0))
+    acquired = lock.acquire(timeout=TASK_LIFECYCLE_LOCK_TIMEOUT_SECONDS)
+    if not acquired:
+        raise ActionError(
+            409,
+            "任务正在切换状态",
+            f"{tid} 正在归档/恢复或启动另一个流程，本次没有执行任何操作。",
+            "等待当前操作结束后重试。",
+        )
+    handle = None
+    try:
+        if depth == 0:
+            handle = _acquire_task_lock_file(tid)
+        TASK_LIFECYCLE_STATE.depth = depth + 1
+        yield
+    finally:
+        TASK_LIFECYCLE_STATE.depth = depth
+        if handle is not None:
+            try:
+                assert fcntl is not None
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                handle.close()
+        lock.release()
+
+
 @dataclass(frozen=True)
 class Delivery:
     folder: str
@@ -585,9 +907,11 @@ class Subtask:
     status: str
     agent_role: str
     log: str = ""
+    run_id: str = ""
     error: str = ""
     started_at: str = ""
     finished_at: str = ""
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -623,6 +947,7 @@ class Task:
     subtasks_error: str
     archived: bool = False
     revise_round: int = 0
+    owner_role: str = DEFAULT_OWNER_ROLE
 
     @property
     def docking_dir(self) -> Path:
@@ -751,19 +1076,40 @@ def _default_workdir(project_dir: Path) -> Path:
     return (project_dir / WORKSPACE_DIRNAME).resolve()
 
 
-def _task_meta_text(meta: Dict[str, str]) -> str:
-    """序列化 task.yaml；核心字段总写，T08 扩展字段仅在非空时写。"""
+def _yaml_emit_meta_extra(key: str, value: object) -> str:
+    """序列化 task.yaml 的未知扩展字段，避免归档/改 workdir 时丢字段。"""
+    if isinstance(value, list):
+        return f"{key}:\n" + "".join(
+            f"  - {_yaml_emit_scalar(str(item))}\n" for item in value
+        )
+    if isinstance(value, bool):
+        return f"{key}: {'true' if value else 'false'}\n"
+    if isinstance(value, (int, float)):
+        return f"{key}: {value}\n"
+    return _yaml_emit_field(key, str(value or ""))
+
+
+def _task_meta_text(meta: Dict[str, object]) -> str:
+    """序列化 task.yaml；核心字段总写，扩展字段仅在非空时写，未知字段原样保留。"""
     core = {"id", "title", "workdir", "created_at"}
     lines: List[str] = []
     for key in TASK_META_KEYS:
         value = meta.get(key, "")
         if key in core or value:
-            lines.append(_yaml_emit_field(key, value))
+            lines.append(_yaml_emit_field(key, str(value)))
+    extras = [
+        key
+        for key in meta
+        if key not in TASK_META_KEYS
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", str(key))
+    ]
+    for key in sorted(extras):
+        lines.append(_yaml_emit_meta_extra(str(key), meta[key]))
     return "".join(lines)
 
 
 def _write_task_meta(
-    path: Path, meta: Dict[str, str], *, create_only: bool = False
+    path: Path, meta: Dict[str, object], *, create_only: bool = False
 ) -> bool:
     """独占创建或写后替换 task.yaml；不触碰其它文件。"""
     text = _task_meta_text(meta)
@@ -807,7 +1153,7 @@ def _normalize_task_meta(
     task_id: str,
     title: str,
     title_mtime: float,
-) -> Dict[str, str]:
+) -> Dict[str, object]:
     def text(key: str, fallback: str) -> str:
         value = data.get(key)
         if value is None or isinstance(value, (dict, list, bool)):
@@ -818,7 +1164,7 @@ def _normalize_task_meta(
     workdir = text("workdir", default_workdir)
     if not Path(workdir).expanduser().is_absolute():
         workdir = default_workdir
-    meta = {
+    meta: Dict[str, object] = {
         "id": task_id.upper(),
         "title": text("title", title),
         "workdir": workdir,
@@ -827,13 +1173,20 @@ def _normalize_task_meta(
     for key in TASK_META_KEYS:
         if key in meta:
             continue
-        meta[key] = text(key, "")
+        meta[key] = text(
+            key, DEFAULT_OWNER_ROLE if key == "owner_role" else ""
+        )
+    # 保留未知扩展字段，避免后续任何一次写回把外部集成字段清掉。
+    for key, value in data.items():
+        if key in meta or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", str(key)):
+            continue
+        meta[str(key)] = value
     return meta
 
 
 def _ensure_task_meta(
     project_dir: Path, task_id: str, title: str, *, title_mtime: float
-) -> Dict[str, str]:
+) -> Dict[str, object]:
     """读取任务元数据；task.yaml 缺失时按默认工作区自动生成。"""
     path = _task_meta_path(project_dir)
     data: Dict[str, object] = {}
@@ -865,7 +1218,7 @@ def _ensure_task_meta(
 
 def _read_task_meta(
     project_dir: Path, task_id: str, *, title: str = "", title_mtime: float = 0.0
-) -> Dict[str, str]:
+) -> Dict[str, object]:
     """读取 task.yaml（不自动补文件），返回带默认值的已知字段。"""
     path = _task_meta_path(project_dir)
     data: Dict[str, object] = {}
@@ -1005,36 +1358,147 @@ def _validate_project_folder(raw: str) -> Path:
 
 
 def _update_task_workdir(task: Task, raw: str) -> Path:
-    if task.archived:
-        raise ActionError(
-            409,
-            "归档任务只读",
-            f"{task.task_id} 位于 归档/，不能修改工作目录。",
-            "先从归档库恢复项目，再修改工作目录。",
+    with _task_lifecycle_lock(task.task_id):
+        latest = _find_task(task.task_id)
+        if latest is None:
+            raise ActionError(
+                409,
+                "任务正在移动",
+                f"{task.task_id} 已不在 项目/ 中，本次没有修改工作目录。",
+                "刷新看板后再试。",
+            )
+        task = latest
+        if task.archived:
+            raise ActionError(
+                409,
+                "归档任务只读",
+                f"{task.task_id} 位于 归档/，不能修改工作目录。",
+                "先从归档库恢复项目，再修改工作目录。",
+            )
+        if _active_dispatch_task() == task.task_id:
+            raise ActionError(
+                409,
+                "任务正在分发",
+                f"{task.task_id} 正在按子任务串行分发，本次不修改工作目录。",
+                "等待分发结束后再修改。",
+            )
+        if _review_active_for(task.task_id) or _active_review_task() == task.task_id:
+            raise ActionError(
+                409,
+                "任务正在审核",
+                f"{task.task_id} 正在由审核角色复核，本次不修改工作目录。",
+                "等待审核结束后再修改。",
+            )
+        if _active_handoff_task() == task.task_id:
+            raise ActionError(
+                409,
+                "任务正在交接体检",
+                f"{task.task_id} 正在检查/补交交接文件，本次不修改工作目录。",
+                "等待交接体检结束后再修改。",
+            )
+        if _active_advance_task() == task.task_id:
+            raise ActionError(
+                409,
+                "任务正在全自动推进",
+                f"{task.task_id} 正在自动分发/审核，本次不修改工作目录。",
+                "等待推进结束后再修改。",
+            )
+        workdir = _ensure_workdir(raw, default=task.workspace_dir)
+        meta = _ensure_task_meta(
+            task.project_dir, task.task_id, task.title, title_mtime=task.mtime
         )
-    workdir = _ensure_workdir(raw, default=task.workspace_dir)
-    meta = _ensure_task_meta(
-        task.project_dir, task.task_id, task.title, title_mtime=task.mtime
-    )
-    meta["workdir"] = str(workdir)
-    try:
-        _write_task_meta(task.meta_path, meta)
-    except ConfigError as exc:
-        raise FormError(f"无法写入 对接/{TASK_META_NAME}：{exc}") from exc
-    return workdir
+        meta["workdir"] = str(workdir)
+        try:
+            _write_task_meta(task.meta_path, meta)
+        except ConfigError as exc:
+            raise FormError(f"无法写入 对接/{TASK_META_NAME}：{exc}") from exc
+        return workdir
+
+
+def _update_task_owner_role(task: Task, raw: str) -> str:
+    """编辑 task.yaml 的 owner_role（无子任务整单修重的责任角色）。"""
+    with _task_lifecycle_lock(task.task_id):
+        latest = _find_task(task.task_id)
+        if latest is None:
+            raise ActionError(
+                409,
+                "任务正在移动",
+                f"{task.task_id} 已不在 项目/ 中，本次没有修改 owner_role。",
+                "刷新看板后再试。",
+            )
+        task = latest
+        if task.archived:
+            raise ActionError(
+                409,
+                "归档任务只读",
+                f"{task.task_id} 位于 归档/，不能修改 owner_role。",
+                "先从归档库恢复项目。",
+            )
+        if (
+            _active_dispatch_task() == task.task_id
+            or _review_active_for(task.task_id)
+            or _active_advance_task() == task.task_id
+            or _active_handoff_task() == task.task_id
+        ):
+            raise ActionError(
+                409,
+                "任务正在运行",
+                f"{task.task_id} 正在分发/审核/推进/体检，本次没有修改 owner_role。",
+                "等待当前运行结束后再修改。",
+            )
+        role_id = str(raw or "").replace("\x00", "").strip()
+        if not role_id:
+            raise FormError("owner_role 不能为空；请填写已存在角色（默认 designer）。")
+        if not CONFIG_ID_RE.fullmatch(role_id):
+            raise FormError("owner_role 只能使用小写字母、数字、下划线或短横线。")
+        role = _find_role(role_id)
+        if role is None:
+            raise FormError(f"owner_role={role_id} 不是已存在角色。")
+        meta = _ensure_task_meta(
+            task.project_dir, task.task_id, task.title, title_mtime=task.mtime
+        )
+        meta["owner_role"] = role_id
+        try:
+            _write_task_meta(task.meta_path, meta)
+        except ConfigError as exc:
+            raise FormError(f"无法写入 对接/{TASK_META_NAME}：{exc}") from exc
+        return role_id
 
 
 def _retarget_task_meta(old_project: Path, new_project: Path) -> None:
-    """归档/恢复后，把仍指向旧项目 工作区/ 的默认 workdir 跟着目录移动。"""
+    """归档/恢复后，只改仍指向旧项目 工作区/ 的默认 workdir。
+
+    逐行替换 `workdir:`，其它字段（含 status/controller/revise_round/
+    auto_advance/idea_sha256/register_log 及未知扩展字段）、顺序与注释
+    原样保留；外部 workdir 不移动，文件不重写。
+    """
     meta_path = _task_meta_path(new_project)
     if not meta_path.is_file():
         return
     try:
-        data = _parse_simple_yaml(_read_text(meta_path))
-    except (OSError, ConfigError):
+        text = _read_text(meta_path)
+    except OSError:
         return
-    raw = data.get("workdir")
-    if not isinstance(raw, str) or not raw.strip() or not Path(raw).is_absolute():
+    workdir_pattern = re.compile(r"^workdir\s*:\s*(.*)$")
+    lines = text.splitlines(keepends=True)
+    workdir_line = -1
+    raw = ""
+    for index, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        if body.startswith((" ", "\t")):
+            continue
+        match = workdir_pattern.match(body)
+        if match is None:
+            continue
+        try:
+            parsed = _yaml_scalar(_strip_yaml_comment(match.group(1)))
+        except ConfigError:
+            return
+        if isinstance(parsed, str):
+            raw = parsed
+            workdir_line = index
+        break
+    if workdir_line < 0 or not raw.strip() or not Path(raw).is_absolute():
         return
     try:
         old_workspace = (old_project / WORKSPACE_DIRNAME).resolve()
@@ -1042,16 +1506,17 @@ def _retarget_task_meta(old_project: Path, new_project: Path) -> None:
         relative = current.relative_to(old_workspace)
     except (OSError, RuntimeError, ValueError):
         return
-    meta = {
-        "id": str(data.get("id") or new_project.name.split("_", 1)[0]).strip(),
-        "title": str(data.get("title") or new_project.name).strip(),
-        "workdir": str((new_project / WORKSPACE_DIRNAME / relative).resolve()),
-        "created_at": str(data.get("created_at") or "").strip(),
-    }
-    if not meta["created_at"]:
-        meta["created_at"] = _now_iso()
+    new_workdir = str((new_project / WORKSPACE_DIRNAME / relative).resolve())
+    original = lines[workdir_line]
+    newline = "\r\n" if original.endswith("\r\n") else "\n" if original.endswith("\n") else ""
+    lines[workdir_line] = (
+        f"workdir: {_yaml_emit_scalar(new_workdir)}{newline}"
+    )
+    updated = "".join(lines)
+    if updated == text:
+        return
     try:
-        _write_task_meta(meta_path, meta)
+        _atomic_write_text(meta_path, updated)
     except ConfigError:
         pass
 
@@ -1196,7 +1661,9 @@ def _build_task(
 
     delivery = _latest_delivery(docking_dir)
     meta = _ensure_task_meta(project_dir, task_id, title, title_mtime=mtime)
-    subtasks, subtasks_error = _load_subtasks(docking_dir / SUBTASKS_NAME)
+    subtasks, subtasks_error = _load_subtasks(
+        docking_dir / SUBTASKS_NAME, task_id
+    )
 
     task = Task(
         task_id=task_id,
@@ -1223,6 +1690,7 @@ def _build_task(
         subtasks_error=subtasks_error,
         archived=archived,
         revise_round=_meta_int(meta.get("revise_round")),
+        owner_role=str(meta.get("owner_role") or DEFAULT_OWNER_ROLE),
     )
     task.status = _task_status_from_phase(task, _task_phase(task))
     return task
@@ -1333,7 +1801,7 @@ def _unique_project_target(parent: Path, project_name: str) -> Path:
 
 def _archive_project(task_id: str, project_name: str = "") -> Path:
     """把 项目/ 中的整个项目目录移动到 归档/；只移动，不删除。"""
-    with PROJECT_MOVE_LOCK:
+    with _task_lifecycle_lock(task_id):
         task = _latest_task(_load_tasks(), task_id, project_name)
         if task is None:
             raise ActionError(
@@ -1388,9 +1856,10 @@ def _archive_project(task_id: str, project_name: str = "") -> Path:
             )
 
         try:
-            ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-            target = _unique_project_target(ARCHIVE_DIR, task.project_name)
-            shutil.move(str(task.project_dir), str(target))
+            with PROJECT_MOVE_LOCK:
+                ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+                target = _unique_project_target(ARCHIVE_DIR, task.project_name)
+                shutil.move(str(task.project_dir), str(target))
             try:
                 _retarget_task_meta(task.project_dir, target)
             except Exception:
@@ -1407,7 +1876,7 @@ def _archive_project(task_id: str, project_name: str = "") -> Path:
 
 def _restore_project(task_id: str, project_name: str = "") -> Path:
     """把 归档/ 中的整个项目目录移回 项目/；只移动，不覆盖同名目录。"""
-    with PROJECT_MOVE_LOCK:
+    with _task_lifecycle_lock(task_id):
         task = _latest_task(_load_archived_tasks(), task_id, project_name)
         if task is None:
             raise ActionError(
@@ -1418,9 +1887,10 @@ def _restore_project(task_id: str, project_name: str = "") -> Path:
             )
 
         try:
-            PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-            target = _unique_project_target(PROJECTS_DIR, task.project_name)
-            shutil.move(str(task.project_dir), str(target))
+            with PROJECT_MOVE_LOCK:
+                PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+                target = _unique_project_target(PROJECTS_DIR, task.project_name)
+                shutil.move(str(task.project_dir), str(target))
             try:
                 _retarget_task_meta(task.project_dir, target)
             except Exception:
@@ -1688,11 +2158,15 @@ def _registration_prompt(
         else "人类没有指定标题：请根据 idea.md 起一个简洁、具体的中文标题。"
     )
     roles, _issues = _load_roles()
-    role_ids = "、".join(
-        role.id
-        for role in roles
-        if role.enabled and role.id != CONTROLLER_ROLE_ID
-    ) or "designer、reviewer"
+    available_roles = [
+        role for role in roles if role.enabled and role.id != CONTROLLER_ROLE_ID
+    ]
+    role_ids = "、".join(role.id for role in available_roles) or "designer、reviewer"
+    owner_suggestion = (
+        DEFAULT_OWNER_ROLE
+        if any(role.id == DEFAULT_OWNER_ROLE for role in roles)
+        else (available_roles[0].id if available_roles else DEFAULT_OWNER_ROLE)
+    )
     return f"""你是协作值班台的总控。你只负责「任务登记 + 拆子任务」，不要执行任何子任务。
 
 任务编号：{task_id}
@@ -1723,11 +2197,15 @@ def _registration_prompt(
        goal: 这个子任务要达成什么
        acceptance: 可检查的验收标准
        status: pending
-   规则：id 唯一且以 {task_id}- 开头；status 只能是 pending/running/delivered/passed/failed，
-   初始一律写 pending；agent_role 可省略，可用角色：{role_ids}。
+   规则：id 必须严格写成 {task_id}-<数字>（大小写不敏感，唯一，禁止 /、\\、..、绝对路径）；
+   status 只能是 pending/running/delivered/passed/failed，初始一律写 pending；
+   每个子任务必须写 agent_role，且必须是已存在角色（可用：{role_ids}）；
+   缺角色或未知角色会让整次登记失败（register_failed）。
 3. 更新 {docking / TASK_META_NAME}
    只把 status 改为 registered；保留 id、title、workdir、created_at 等既有字段。
-   若 human 未指定标题，可同时把 title 补成你起的标题。不要改 workdir。
+   同时写入 owner_role: {owner_suggestion}（必须是已存在角色；仅无子任务整单重修时回叫它，
+   人类之后可在任务详情编辑）。不要改 workdir。
+   若 human 未指定标题，可同时把 title 补成你起的标题。
 4. 最后写完成信号 {docking / REGISTER_DONE_NAME}
    写标题、子任务数量和时间即可。此文件必须最后写，表示登记完成。
 
@@ -1859,11 +2337,30 @@ def _registration_result_error(
     except OSError:
         pass
 
-    subtasks, subtasks_error = _load_subtasks(subtasks_path)
+    project_match = PROJECT_NAME_RE.fullmatch(project_dir.name)
+    expected_task_id = project_match.group(1) if project_match else ""
+    subtasks, subtasks_error = _load_subtasks(
+        subtasks_path, expected_task_id
+    )
     if subtasks_error:
         problems.append(subtasks_error)
-    elif not (2 <= len(subtasks) <= 6):
-        problems.append(f"子任务数量为 {len(subtasks)}，要求 2–6 个")
+    else:
+        roles, _role_issues = _load_roles()
+        known_roles = sorted({role.id for role in roles})
+        available_text = "、".join(known_roles) or "（无已登记角色）"
+        for item in subtasks:
+            if not item.agent_role:
+                problems.append(
+                    f"子任务 {item.id} 缺少 agent_role"
+                    f"（每个子任务必须填写已存在角色：{available_text}）"
+                )
+            elif item.agent_role not in known_roles:
+                problems.append(
+                    f"子任务 {item.id} 的 agent_role={item.agent_role} 不存在"
+                    f"（可用：{available_text}）"
+                )
+        if not (2 <= len(subtasks) <= 6):
+            problems.append(f"子任务数量为 {len(subtasks)}，要求 2–6 个")
     if problems:
         return "；".join(problems), None, subtasks
 
@@ -2178,6 +2675,103 @@ def _reconcile_stale_registrations() -> int:
     return repaired
 
 
+def _reconcile_interrupted_subtasks() -> int:
+    """启动时收尾崩溃遗留：无活锁/无对应进程的 running 子任务置 failed。
+
+    · 有活锁（runner.lock 指向仍存活进程）的任务不动；
+    · 内存里仍有分发/审核/推进/体检线程的任务不动；
+    · 只改 status/error/finished_at，log/run_id 原样保留（缺失时从
+      runner.status 的本轮记录补齐），恢复后「继续分发」会选中 failed 项。
+    """
+    if not PROJECTS_DIR.is_dir():
+        return 0
+    try:
+        lock = _runner().lock_info()
+    except Exception:
+        lock = {}
+    lock_active = bool(lock.get("active"))
+    lock_task = str(lock.get("task") or "").upper() if lock_active else ""
+    if lock_active and not lock_task:
+        # 锁刚创建但内容未写全：无法判断归属，宁可不动。
+        return 0
+    live_tasks = {
+        value.upper()
+        for value in (
+            _active_dispatch_task(),
+            _active_review_task(),
+            _active_advance_task(),
+            _active_handoff_task(),
+        )
+        if value
+    }
+    if lock_task:
+        live_tasks.add(lock_task)
+    try:
+        status = _runner().read_status()
+    except Exception:
+        status = {}
+    status_task = str(status.get("task") or "").upper()
+    status_subtask = str(status.get("subtask") or "")
+    status_log = str(status.get("log") or "")
+    status_run_id = str(status.get("run_id") or "")
+
+    repaired = 0
+    try:
+        entries = list(PROJECTS_DIR.iterdir())
+    except OSError:
+        return 0
+    for project_dir in entries:
+        match = PROJECT_NAME_RE.fullmatch(project_dir.name)
+        if not match or not project_dir.is_dir() or project_dir.is_symlink():
+            continue
+        task_id = match.group(1).upper()
+        if task_id in live_tasks:
+            continue
+        subtasks_path = project_dir / DOCKING_DIRNAME / SUBTASKS_NAME
+        subtasks, error = _load_subtasks(subtasks_path, task_id)
+        if error or not subtasks:
+            continue
+        task_repaired = 0
+        for item in subtasks:
+            if item.status != "running":
+                continue
+            updates = {
+                "status": "failed",
+                "error": "interrupted",
+                "finished_at": _now_iso(),
+            }
+            if not item.log and status_task == task_id and (
+                not status_subtask or status_subtask == item.id
+            ):
+                if status_log:
+                    updates["log"] = status_log
+            if not item.run_id and status_task == task_id and (
+                not status_subtask or status_subtask == item.id
+            ):
+                if status_run_id:
+                    updates["run_id"] = status_run_id
+            try:
+                _update_subtask_record(subtasks_path, item.id, updates)
+                repaired += 1
+                task_repaired += 1
+            except Exception:
+                traceback.print_exc()
+        if task_repaired:
+            state = _read_dispatch_state_file(task_id)
+            if str(state.get("state") or "") == "running":
+                state["state"] = "failed"
+                state["finished_at"] = _now_iso()
+                state["message"] = (
+                    "上次分发没有正常收尾；running 子任务已标记为 failed"
+                    "（interrupted），可继续分发重试。"
+                )
+                try:
+                    _write_dispatch_state_file(state)
+                except Exception:
+                    traceback.print_exc()
+    return repaired
+
+
 def _registration_payload(task_id: str) -> Dict[str, object]:
     project_dir = _find_registration_project(task_id)
     if project_dir is None:
@@ -2191,7 +2785,9 @@ def _registration_payload(task_id: str) -> Dict[str, object]:
     status = str(meta.get("status") or "")
     if status not in {REGISTERING, REGISTERED, REGISTER_FAILED}:
         status = REGISTER_FAILED
-    subtasks, _error = _load_subtasks(project_dir / DOCKING_DIRNAME / SUBTASKS_NAME)
+    subtasks, _error = _load_subtasks(
+        project_dir / DOCKING_DIRNAME / SUBTASKS_NAME, task_id
+    )
     task_sheet = project_dir / DOCKING_DIRNAME / TASK_SHEET_NAME
     title = str(meta.get("title") or "")
     if task_sheet.is_file() and not title:
@@ -2495,14 +3091,122 @@ def _dispatch_preflight(
     return bindings, violations
 
 
-def _dispatch_prompt(role: Role, subtask: Subtask, workdir: Path) -> str:
-    return (
+def _markdown_section_text(text: str, keywords: Tuple[str, ...]) -> str:
+    """取标题含关键词的 Markdown 章节原文；遇到同级/更高级标题结束。"""
+    if not text:
+        return ""
+    collected: List[str] = []
+    in_section = False
+    level = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        heading = re.match(r"^(#{1,6})\s*(.+?)\s*$", line)
+        bold_heading = (
+            re.match(r"^\*\*(.+?)\*\*\s*$", line) if line.startswith("**") else None
+        )
+        title = heading or bold_heading
+        if title is not None:
+            new_level = len(heading.group(1)) if heading else 7
+            label = (
+                heading.group(2) if heading else bold_heading.group(1)
+            ).strip()
+            matched = any(keyword in label for keyword in keywords)
+            if in_section and new_level <= level:
+                if matched:
+                    level = new_level
+                    continue
+                break
+            if not in_section and matched:
+                in_section = True
+                level = new_level
+            continue
+        if in_section:
+            collected.append(raw_line)
+    return "\n".join(collected).strip()
+
+
+def _task_sheet_prohibitions(task: Task) -> str:
+    """父任务单「禁止事项」全文；供修订提示词原样传递。"""
+    try:
+        text = _read_text(task.path)
+    except OSError:
+        return "（任务单不可读）"
+    section = _markdown_section_text(text, ("禁止",))
+    return section or "（任务单未写禁止事项）"
+
+
+def _dispatch_revision_block(
+    context: Dict[str, object], subtask: Subtask
+) -> str:
+    """修订上下文：父任务单/禁止事项、问题全文、审查快照与轮次、回归验收。"""
+    round_no = str(context.get("round") or "?")
+    sheet = str(context.get("parent_task_sheet") or "")
+    prohibitions = str(context.get("prohibitions") or "（未提供）").strip()
+    issues = str(context.get("issues_full") or "").strip()
+    snapshot = str(context.get("review_snapshot") or "")
+    related = [
+        line
+        for line in issues.splitlines()
+        if subtask.id.lower() in line.lower()
+    ]
+    related_text = "\n".join(related).strip() or (
+        "（问题清单没有点名本子任务；仍须按下方全文逐条自查）"
+    )
+    lines = [
+        "",
+        f"=== 修订上下文 · 第 {round_no} 轮（必须先读，优先级高于普通建议） ===",
+        f"- 父任务单（绝对路径）：{sheet}",
+        "- 父任务单「禁止事项」全文：",
+        prohibitions,
+        f"- 本轮审查中与本子任务（{subtask.id}）直接相关的问题（原文）：",
+        related_text,
+        "- 本轮审查问题清单全文（原文）：",
+        issues or "（审查未提供问题清单）",
+        f"- 上一轮审查快照（绝对路径）：{snapshot}",
+        f"- 审查轮次：第 {round_no} 轮",
+        "- 回归验收要求：",
+        f"  · 重做后必须重新满足本子任务验收标准：{subtask.acceptance or '（未填写）'}",
+        "  · 在 DONE.md 的「怎么验」写清本轮复跑命令与结果，并逐条对应上面的问题",
+        "  · 不得回退上一轮已通过的其它子任务产物，不得缩小原有验收范围",
+        "  · 只写本子任务输出目录；发现问题无法在本子任务内解决时在 DONE.md 注明",
+    ]
+    return "\n".join(lines)
+
+
+def _dispatch_prompt(
+    role: Role,
+    subtask: Subtask,
+    workdir: Path,
+    *,
+    output_dir: Optional[Path] = None,
+    revise_context: Optional[Dict[str, object]] = None,
+    attempt: int = 0,
+) -> str:
+    output = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else (Path(workdir) / "子任务" / subtask.id).resolve()
+    )
+    done_path = output / DONE_NAME
+    prompt = (
         f"你是 {role.name}。执行子任务 {subtask.id}：{subtask.title}\n"
         f"目标：{subtask.goal or '（未填写）'} · 验收：{subtask.acceptance or '（未填写）'}\n"
-        f"工作目录：{workdir}（产物写这里，建议 工作区/子任务/{subtask.id}/）\n"
-        f"完成后写 `工作区/子任务/{subtask.id}/DONE.md`（含：做了什么/怎么验/结果）\n"
+        f"工作目录（cwd）：{workdir}\n"
+        f"输出目录（绝对路径）：{output}\n"
+        f"完成后写 DONE.md（绝对路径）：{done_path}"
+        f"（含：做了什么/怎么验/结果）\n"
+        "★ 所有产物与 DONE.md 只能写在上述输出目录内；不要再套一层 工作区/。\n"
         "★ 不得写 对接/审查.md；不得改其它子任务；不删文件"
     )
+    if attempt > 0:
+        prompt += (
+            f"\n★ 本次分发记录：attempt: {attempt}。DONE.md 必须原样包含一行 "
+            f"`attempt: {attempt}`（与本次分发一致）；若另写 `run_id:`，"
+            "也必须与本次运行一致。缺少或不匹配会被 G2 判为缺件。"
+        )
+    if revise_context:
+        prompt += _dispatch_revision_block(revise_context, subtask)
+    return prompt
 
 
 def _dispatch_targets(task: Task) -> Tuple[Subtask, ...]:
@@ -2635,6 +3339,7 @@ def _dispatch_worker(
     runs: Tuple[Subtask, ...],
     bindings: Dict[str, Dict[str, object]],
     state: Dict[str, object],
+    revise_context: Optional[Dict[str, object]] = None,
 ) -> None:
     global ACTIVE_DISPATCH
     try:
@@ -2660,6 +3365,7 @@ def _dispatch_worker(
                 ),
             )
             started_at = _now_iso()
+            attempt = int(getattr(subtask, "attempt", 0) or 0) + 1
             try:
                 _update_subtask_record(
                     task.subtasks_path,
@@ -2670,6 +3376,8 @@ def _dispatch_worker(
                         "finished_at": "",
                         "error": "",
                         "log": "",
+                        "run_id": "",
+                        "attempt": str(attempt),
                     },
                 )
             except Exception as exc:
@@ -2691,20 +3399,40 @@ def _dispatch_worker(
             log_prefix = "dispatch-" + (
                 re.sub(r"[^A-Za-z0-9_-]+", "_", subtask.id)[:40] or "subtask"
             )
+            output_dir = _subtask_output_dir(task, subtask)
             try:
                 runner = _runner()
-                runner.launch(
+                launched = runner.launch(
                     task_id=task.task_id,
                     task_dir=task.project_dir,
                     agent=spec,
                     round_no=1,
                     workdir=task.workdir,
-                    prompt=_dispatch_prompt(role, subtask, task.workdir),
+                    prompt=_dispatch_prompt(
+                        role,
+                        subtask,
+                        task.workdir,
+                        output_dir=output_dir,
+                        revise_context=revise_context,
+                        attempt=attempt,
+                    ),
                     kind="dispatch",
                     subtask_id=subtask.id,
                     subtask_title=subtask.title,
                     log_prefix=log_prefix,
                 )
+                # 先落 run_id/log：控制台崩溃后恢复时据此保留现场。
+                try:
+                    _update_subtask_record(
+                        task.subtasks_path,
+                        subtask.id,
+                        {
+                            "log": str(launched.get("log") or ""),
+                            "run_id": str(launched.get("run_id") or ""),
+                        },
+                    )
+                except Exception:
+                    traceback.print_exc()
             except Exception as exc:
                 error = f"未能启动 Agent：{exc}"
                 try:
@@ -2716,6 +3444,7 @@ def _dispatch_worker(
                             "error": error[:2_000],
                             "finished_at": _now_iso(),
                             "log": "",
+                            "run_id": "",
                         },
                     )
                 except Exception:
@@ -2740,18 +3469,22 @@ def _dispatch_worker(
                 if result_state != "success" and not error:
                     error = f"Agent 以 {result_state} 状态结束。"
             log = str(final.get("log") or "")
+            run_id = str(final.get("run_id") or "")
             delivered = result_state == "success"
             finished_at = _now_iso()
             try:
+                updates = {
+                    "status": "delivered" if delivered else "failed",
+                    "log": log,
+                    "finished_at": finished_at,
+                    "error": "" if delivered else error[:2_000],
+                }
+                if run_id:
+                    updates["run_id"] = run_id
                 _update_subtask_record(
                     task.subtasks_path,
                     subtask.id,
-                    {
-                        "status": "delivered" if delivered else "failed",
-                        "log": log,
-                        "finished_at": finished_at,
-                        "error": "" if delivered else error[:2_000],
-                    },
+                    updates,
                 )
             except Exception as exc:
                 _dispatch_fail(
@@ -2825,11 +3558,21 @@ def _dispatch_worker(
 
 
 def _start_dispatch(
-    task: Task, *, _advance_owned: bool = False
+    task: Task,
+    *,
+    _advance_owned: bool = False,
+    revise_context: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """预检 pending/failed 子任务后启动分发线程；失败时不启动任何进程。"""
     global ACTIVE_DISPATCH
     with DISPATCH_START_LOCK:
+        if _advance_owned and _advance_stop_requested():
+            raise ActionError(
+                409,
+                "推进已请求停止",
+                "用户已请求停止全自动推进；本次没有启动任何子任务。",
+                "等待停止完成后刷新页面。",
+            )
         if not _advance_owned:
             active_advance = _active_advance_task()
             if active_advance:
@@ -2839,6 +3582,23 @@ def _start_dispatch(
                     f"{active_advance} 的全自动推进占用执行器；本次没有启动任何进程。",
                     "等待推进结束后再手动分发。",
                 )
+        with _task_lifecycle_lock(task.task_id):
+            current = _find_task(task.task_id)
+            if current is None:
+                raise ActionError(
+                    409,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
+                )
+            if current.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能分发实现。",
+                    "先从归档库恢复项目。",
+                )
+            task = current
         if ACTIVE_DISPATCH is not None:
             active_task = str(ACTIVE_DISPATCH.get("task") or "")
             raise ActionError(
@@ -2902,7 +3662,7 @@ def _start_dispatch(
                 f"{task.task_id} 缺少 对接/subtasks.yaml，未启动任何进程。",
                 "先完成总控登记，生成子任务清单后再分发。",
             )
-        subtasks, error = _load_subtasks(task.subtasks_path)
+        subtasks, error = _load_subtasks(task.subtasks_path, task.task_id)
         if error:
             raise ActionError(
                 400,
@@ -2949,74 +3709,190 @@ def _start_dispatch(
         if not bool(handoff.get("passed")):
             raise _handoff_action_error(handoff)
 
-        retried = 0
-        for item in pending:
-            if item.status != "failed":
-                continue
-            try:
-                _update_subtask_record(
-                    task.subtasks_path,
-                    item.id,
-                    {
-                        "status": "pending",
-                        "started_at": "",
-                        "finished_at": "",
-                        "error": "",
-                        "log": "",
-                    },
+        with _task_lifecycle_lock(task.task_id):
+            latest = _find_task(task.task_id)
+            if latest is None:
+                raise ActionError(
+                    409,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
                 )
-            except Exception as exc:
+            if latest.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能分发实现。",
+                    "先从归档库恢复项目。",
+                )
+            task = latest
+            if ACTIVE_DISPATCH is not None:
+                active_task = str(ACTIVE_DISPATCH.get("task") or "")
+                raise ActionError(
+                    409,
+                    "已有分发在跑",
+                    f"{active_task or '另一个任务'} 正在分发实现；"
+                    "同一时刻只允许一个分发。",
+                    "等待当前分发结束，或到 /runs 查看运行状态。",
+                )
+            if not _advance_owned:
+                active_advance = _active_advance_task()
+                if active_advance:
+                    raise ActionError(
+                        409,
+                        "全自动推进正在运行",
+                        f"{active_advance} 的全自动推进占用执行器；"
+                        "本次没有启动任何进程。",
+                        "等待推进结束后再手动分发。",
+                    )
+            if ACTIVE_REGISTRATIONS:
+                raise ActionError(
+                    409,
+                    "总控登记正在运行",
+                    "已有总控登记占用执行器；本次没有启动任何进程。",
+                    "等待登记结束后再分发。",
+                )
+            if _handoff_blocked_for(task.task_id):
+                raise ActionError(
+                    409,
+                    "交接体检未通过",
+                    "交接体检已阻塞，本次没有启动任何进程。",
+                    "先补齐缺件或重试体检。",
+                )
+            active_handoff = _active_handoff_task()
+            if active_handoff:
+                raise ActionError(
+                    409,
+                    "交接体检正在运行",
+                    f"{active_handoff} 正在检查/补交交接文件，本次没有启动任何进程。",
+                    "等待交接体检结束后再分发。",
+                )
+            if ACTIVE_REVIEW is not None:
+                active_review_task = str(ACTIVE_REVIEW.get("task") or "")
+                raise ActionError(
+                    409,
+                    "审核正在运行",
+                    f"{active_review_task or '另一个任务'} 正在审核；"
+                    "同一时刻只允许一个执行器写手，本次没有启动任何进程。",
+                    "等待审核结束后再分发。",
+                )
+            try:
+                lock = _runner().lock_info()
+            except Exception:
+                lock = {}
+            if lock.get("active"):
+                raise ActionError(
+                    409,
+                    "执行器正忙",
+                    f"执行器正在运行 {lock.get('task') or '未知任务'}；"
+                    "本次没有启动任何进程。",
+                    "等待当前运行结束后再分发。",
+                )
+            subtasks, error = _load_subtasks(
+                task.subtasks_path, task.task_id
+            )
+            if error:
+                raise ActionError(
+                    400,
+                    "子任务清单无法解析",
+                    f"{error} 未启动任何进程。",
+                    "修正 对接/subtasks.yaml 后重试。",
+                )
+            pending = tuple(
+                item for item in subtasks if item.status in {"pending", "failed"}
+            )
+            if not pending:
+                raise ActionError(
+                    400,
+                    "没有待开始或失败的子任务",
+                    "所有子任务都是 delivered/passed，未启动任何进程。",
+                    "查看子任务表格；下一步是开始审核。",
+                )
+            roles, _role_issues = _load_roles()
+            agents, _agent_issues = _load_agents()
+            bindings, violations = _dispatch_preflight(pending, roles, agents)
+            if violations:
+                raise ActionError(
+                    409,
+                    "分发预检未通过",
+                    "以下子任务的角色绑定不满足要求，未启动任何进程："
+                    + "；".join(violations),
+                    "到 /roles 绑定可执行 Agent，或修正 subtasks.yaml 的 agent_role。",
+                    violations=violations,
+                )
+
+            retried = 0
+            for item in pending:
+                if item.status != "failed":
+                    continue
+                try:
+                    _update_subtask_record(
+                        task.subtasks_path,
+                        item.id,
+                        {
+                            "status": "pending",
+                            "started_at": "",
+                            "finished_at": "",
+                            "error": "",
+                            "log": "",
+                            "run_id": "",
+                        },
+                    )
+                except Exception as exc:
+                    raise ActionError(
+                        500,
+                        "失败子任务无法重置",
+                        f"{item.id} 无法从 failed 重置为 pending：{exc}；未启动任何进程。",
+                        "检查 对接/subtasks.yaml 后重试。",
+                    ) from exc
+                retried += 1
+
+            first = pending[0]
+            state: Dict[str, object] = {
+                "ok": True,
+                "task": task.task_id,
+                "state": "running",
+                "total": len(pending),
+                "done": 0,
+                "success": 0,
+                "failed": 0,
+                "retried": retried,
+                "current_index": 1,
+                "current_subtask": first.id,
+                "current_title": first.title,
+                "started_at": _now_iso(),
+                "finished_at": "",
+                "message": f"分发中… 当前子任务 {first.id} {first.title}",
+                "results": [],
+            }
+            if revise_context:
+                state["revise"] = True
+                state["revise_round"] = str(revise_context.get("round") or "")
+            initial_state = copy.deepcopy(state)
+            thread = threading.Thread(
+                target=_dispatch_worker,
+                args=(task, pending, bindings, state, revise_context),
+                name=f"dispatch-{task.task_id}",
+                daemon=True,
+            )
+            with DISPATCH_STATE_LOCK:
+                ACTIVE_DISPATCH = {"task": task.task_id, "state": state}
+                _write_dispatch_state_file(state)
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                with DISPATCH_STATE_LOCK:
+                    ACTIVE_DISPATCH = None
+                    state["state"] = "failed"
+                    state["message"] = f"分发线程无法启动：{exc}"
+                    _write_dispatch_state_file(state)
                 raise ActionError(
                     500,
-                    "失败子任务无法重置",
-                    f"{item.id} 无法从 failed 重置为 pending：{exc}；未启动任何进程。",
-                    "检查 对接/subtasks.yaml 后重试。",
+                    "分发未能启动",
+                    f"分发线程无法启动：{exc}",
+                    "查看控制台终端错误信息后重试。",
                 ) from exc
-            retried += 1
-
-        first = pending[0]
-        state: Dict[str, object] = {
-            "ok": True,
-            "task": task.task_id,
-            "state": "running",
-            "total": len(pending),
-            "done": 0,
-            "success": 0,
-            "failed": 0,
-            "retried": retried,
-            "current_index": 1,
-            "current_subtask": first.id,
-            "current_title": first.title,
-            "started_at": _now_iso(),
-            "finished_at": "",
-            "message": f"分发中… 当前子任务 {first.id} {first.title}",
-            "results": [],
-        }
-        initial_state = copy.deepcopy(state)
-        thread = threading.Thread(
-            target=_dispatch_worker,
-            args=(task, pending, bindings, state),
-            name=f"dispatch-{task.task_id}",
-            daemon=True,
-        )
-        with DISPATCH_STATE_LOCK:
-            ACTIVE_DISPATCH = {"task": task.task_id, "state": state}
-            _write_dispatch_state_file(state)
-        try:
-            thread.start()
-        except RuntimeError as exc:
-            with DISPATCH_STATE_LOCK:
-                ACTIVE_DISPATCH = None
-                state["state"] = "failed"
-                state["message"] = f"分发线程无法启动：{exc}"
-                _write_dispatch_state_file(state)
-            raise ActionError(
-                500,
-                "分发未能启动",
-                f"分发线程无法启动：{exc}",
-                "查看控制台终端错误信息后重试。",
-            ) from exc
-        return initial_state
+            return initial_state
 
 
 def _dispatch_status_payload(task: Task) -> Dict[str, object]:
@@ -3187,9 +4063,13 @@ def _subtasks_all_delivered(task: Task) -> bool:
 
 
 def _workspace_product_entries(task: Task) -> List[FileEntry]:
-    """工作区里除运行日志以外的产物；任务级审核允许没有 subtasks.yaml。"""
+    """workdir 里除运行日志以外的产物；任务级审核允许没有 subtasks.yaml。
+
+    默认 workdir 就是 工作区/，外部 workdir 则直接扫外部目录，保持与
+    子任务 output_dir 相同的路径口径。
+    """
     products: List[FileEntry] = []
-    for entry in _collect_files(task.workspace_dir):
+    for entry in _collect_files(task.workdir):
         relative = entry.relative.replace("\\", "/")
         if relative == "日志" or relative.startswith("日志/"):
             continue
@@ -3384,20 +4264,34 @@ def _gate_g1(task: Task) -> Dict[str, object]:
 
 
 def _subtask_output_dir(task: Task, subtask: Subtask) -> Path:
-    primary = task.workdir / "子任务" / subtask.id
-    candidates = [primary]
+    """唯一交付目录：workdir/子任务/<id>（绝对路径）。
+
+    默认 workdir 与外部 workdir 走同一条规则；提示词、G2、审核与日志
+    都引用这个结果，避免提示词多一层 `工作区/` 而 G2 查不到。
+    ID 再次做边界校验；resolve 后必须仍在 workdir 或项目工作区内。
+    """
+    subtask_id = str(subtask.id or "")
+    problem = _subtask_id_problem(subtask_id, task.task_id)
+    if problem:
+        raise ConfigError(f"子任务 id 不合法：{subtask_id or '（空）'}（{problem}）")
+    workdir = Path(task.workdir).resolve()
+    output = (workdir / "子任务" / subtask_id).resolve()
+    allowed = (workdir, Path(task.workspace_dir).resolve())
+    if not any(_is_within(output, root) for root in allowed):
+        raise ConfigError(
+            f"子任务 {subtask_id} 的输出目录越界：{output}"
+            f"（允许根：{workdir} 或 {allowed[1]}）"
+        )
+    return output
+
+
+def _path_label(path: Path) -> str:
+    """页面/闸门提示用路径：值班台内显示相对路径，外部显示绝对路径。"""
+    candidate = Path(path)
     try:
-        if task.workdir.resolve() != task.workspace_dir.resolve():
-            candidates.append(task.workspace_dir / "子任务" / subtask.id)
-    except OSError:
-        pass
-    for candidate in candidates:
-        if (candidate / DONE_NAME).is_file():
-            return candidate
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    return primary
+        return str(candidate.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(candidate)
 
 
 def _subtask_products(output_dir: Path) -> List[Path]:
@@ -3416,6 +4310,54 @@ def _subtask_products(output_dir: Path) -> List[Path]:
     return products
 
 
+def _done_marker_value(text: str, key: str) -> str:
+    match = re.search(
+        rf"(?im)^\s*(?:[-*+]\s*)?{re.escape(key)}\s*[:：]\s*([^\s`|]+)",
+        text or "",
+    )
+    if match is None:
+        return ""
+    return match.group(1).strip().strip("`\"'")
+
+
+def _done_freshness_problems(done_text: str, subtask: Subtask) -> List[str]:
+    """DONE.md 必须声明与当前分发记录一致的 run_id 或 attempt。
+
+    旧版任务没有 attempt/run_id 记录时保持兼容（不做新鲜度判定）；
+    新分发一定写入 attempt，因此旧 DONE 无法蒙混过关。
+    """
+    recorded_run_id = str(subtask.run_id or "").strip()
+    recorded_attempt = int(getattr(subtask, "attempt", 0) or 0)
+    if recorded_attempt <= 0 and not recorded_run_id:
+        return []
+    done_run_id = _done_marker_value(done_text, "run_id")
+    done_attempt_text = _done_marker_value(done_text, "attempt")
+    if not done_run_id and not done_attempt_text:
+        return [
+            f"{DONE_NAME} 缺少本次分发记录（必须含 run_id: 或 attempt:，"
+            f"本次 attempt={recorded_attempt or '—'}）"
+        ]
+    problems: List[str] = []
+    if done_attempt_text:
+        try:
+            done_attempt = int(done_attempt_text)
+        except ValueError:
+            problems.append(f"{DONE_NAME} 的 attempt 不是整数：{done_attempt_text}")
+        else:
+            if recorded_attempt <= 0 or done_attempt != recorded_attempt:
+                problems.append(
+                    f"{DONE_NAME} 的 attempt={done_attempt} 与本次分发记录"
+                    f"（{recorded_attempt or '空'}）不一致"
+                )
+    if done_run_id:
+        if not recorded_run_id or done_run_id != recorded_run_id:
+            problems.append(
+                f"{DONE_NAME} 的 run_id={done_run_id} 与本次分发记录"
+                f"（{recorded_run_id or '空'}）不一致"
+            )
+    return problems
+
+
 def _gate_g2(task: Task) -> List[Dict[str, object]]:
     """每个已交付子任务都是一道 G2 闸门，责任方是其 agent_role。"""
     checks: List[Dict[str, object]] = []
@@ -3423,11 +4365,23 @@ def _gate_g2(task: Task) -> List[Dict[str, object]]:
         if subtask.status not in {"delivered", "passed"}:
             continue
         owner = subtask.agent_role.strip() or "（未填写）"
-        output_dir = _subtask_output_dir(task, subtask)
+        try:
+            output_dir = _subtask_output_dir(task, subtask)
+        except ConfigError as exc:
+            checks.append(
+                _handoff_gate_check(
+                    "G2",
+                    owner,
+                    missing=[f"子任务输出目录不安全：{exc}"],
+                    subtask=subtask.id,
+                    repair_paths=[Path(task.workdir)],
+                )
+            )
+            continue
         done_path = output_dir / DONE_NAME
         missing: List[str] = []
         if not done_path.is_file():
-            missing.append(f"工作区/子任务/{subtask.id}/{DONE_NAME}")
+            missing.append(_path_label(done_path))
         else:
             try:
                 done_text = _read_text(done_path)
@@ -3444,14 +4398,15 @@ def _gate_g2(task: Task) -> List[Dict[str, object]]:
                     + "/".join(HANDOFF_REQUIRED_DONE_MARKERS)
                     + f"（缺 {'、'.join(absent)}）"
                 )
+            missing.extend(_done_freshness_problems(done_text, subtask))
         products = _subtask_products(output_dir)
         if not products:
             missing.append(
-                f"工作区/子任务/{subtask.id}/ 至少 1 个产物文件（非 {DONE_NAME}）"
+                f"{_path_label(output_dir)}/ 至少 1 个产物文件（非 {DONE_NAME}）"
             )
         detail = ""
         if not missing:
-            detail = f"通过：DONE.md + {len(products)} 个产物"
+            detail = f"通过：{_path_label(done_path)} + {len(products)} 个产物"
         checks.append(
             _handoff_gate_check(
                 "G2",
@@ -3608,6 +4563,7 @@ def _handoff_prompt(
     *,
     role_id: str,
     role_name: str,
+    agent_id: str = "",
 ) -> str:
     missing_lines: List[str] = []
     for check in checks:
@@ -3630,6 +4586,17 @@ def _handoff_prompt(
             missing_lines.append(
                 "  可写入路径：" + "、".join(str(path) for path in repair_paths)
             )
+        if str(check.get("gate") or "") == "G2":
+            subtask_id = str(check.get("subtask") or "")
+            subtask = next(
+                (item for item in task.subtasks if item.id == subtask_id), None
+            )
+            attempt = int(getattr(subtask, "attempt", 0) or 0) if subtask else 0
+            if attempt > 0:
+                missing_lines.append(
+                    f"  ★ 本次分发记录 attempt: {attempt}；补写的 {DONE_NAME} "
+                    f"必须包含一行 `attempt: {attempt}`，否则 G2 仍判缺件。"
+                )
     missing_text = "\n".join(missing_lines)
     missing_summary = "；".join(
         f"{check.get('key')} "
@@ -3650,6 +4617,15 @@ def _handoff_prompt(
         review_rule = (
             f"你是 reviewer，可以补写 对接/{REVIEW_NAME}；不得改子任务产物。"
         )
+        if agent_id:
+            review_rule += (
+                "\n- 补写的 审查.md 开头必须原样写入下面两行"
+                "（角色与 Agent 不得改写）：\n"
+                + _review_attribution_header(role_name, agent_id)
+                + "- 头部第三行写实际结论（二选一）："
+                "`- 结论：**通过**` 或 `- 结论：**须修正**`。\n"
+                "- ★ 不得自称 AI-A，也不得在审查中出现 `AI-A` 字样。"
+            )
     elif role_id == REVIEW_ROLE_ID:
         review_rule = (
             f"★ 本次不是审核完成闸门（{','.join(sorted(gate_ids))}）："
@@ -3671,7 +4647,8 @@ def _handoff_prompt(
         "补写要求：\n"
         "- 只补上面列出的缺失文件；已有文件不得删除或重做。\n"
         f"- {DONE_NAME} 必须含「做了什么 / 怎么验 / 结果」三部分。\n"
-        "- 子任务产物写在工作目录的 子任务/<子任务id>/ 下。\n"
+        "- 子任务产物与 DONE.md 写入上面「可写入路径」列出的绝对路径"
+        "（统一为 <工作目录>/子任务/<子任务id>/）。\n"
         f"- {review_rule}\n"
         "- 不删除文件，不改其它子任务，不重启 8787。\n"
         "补完即退出。"
@@ -3705,7 +4682,18 @@ def _launch_handoff_agent(
         log_prefix=f"handoff-{safe_role}-{attempt}",
         cwd=task.project_dir,
     )
-    finished = runner.wait_for_idle(runner.timeout_seconds + 120.0)
+    deadline = time.monotonic() + runner.timeout_seconds + 120.0
+    finished = False
+    while time.monotonic() < deadline:
+        if runner.wait_for_idle(0.2):
+            finished = True
+            break
+        abort_state, abort_reason = _active_advance_abort(task.task_id)
+        if abort_state:
+            _stop_active_runner_for_task(task.task_id, abort_reason)
+            break
+    if not finished:
+        finished = runner.wait_for_idle(0.0)
     snapshot = dict(runner.snapshot())
     return {
         "agent": agent.id,
@@ -3813,6 +4801,36 @@ def _run_handoff_gates(
             _write_handoff_state_file(state)
         try:
             while True:
+                abort_state, abort_reason = _active_advance_abort(task.task_id)
+                if abort_state:
+                    _stop_active_runner_for_task(task.task_id, abort_reason)
+                    state["state"] = "blocked"
+                    state["passed"] = False
+                    state["finished_at"] = _now_iso()
+                    state["error"] = (
+                        "用户请求停止全自动推进，交接检查中止。"
+                        if abort_state == "stopped"
+                        else "推进预算用尽，交接检查中止：" + abort_reason
+                    )
+                    state["message"] = (
+                        "用户停止推进；交接检查已中止。"
+                        if abort_state == "stopped"
+                        else "预算用尽；交接检查已中止。"
+                    )
+                    _append_handoff_log(
+                        log_path,
+                        [
+                            "- 结论：中止（"
+                            + (
+                                "用户停止推进"
+                                if abort_state == "stopped"
+                                else "预算用尽"
+                            )
+                            + "）",
+                            f"- 结束：{state['finished_at']}",
+                        ],
+                    )
+                    break
                 checks = _handoff_checks_for(
                     task,
                     stage,
@@ -3996,6 +5014,7 @@ def _run_handoff_gates(
                         group_checks,
                         role_id=role_id,
                         role_name=role_name,
+                        agent_id=agent.id,
                     )
                     with HANDOFF_STATE_LOCK:
                         _write_handoff_state_file(state)
@@ -4131,8 +5150,102 @@ def _ensure_handoff_not_blocked(task: Task) -> None:
     )
 
 
+def _review_terminal_state(task: Task) -> Tuple[bool, str]:
+    """审核终态只认「审查.md 明确结论」＋「审核完成.md 存在」。
+
+    新审查（review 状态文件带 attribution_required）还必须通过署名校验；
+    历史审查没有该标记，按旧规则判定，避免改写/推翻 T05–T23 的既有结论。
+    """
+    if task.review_path is None:
+        return False, ""
+    verdict = _review_verdict(task.review_text)
+    if not verdict:
+        return False, ""
+    if not (task.docking_dir / REVIEW_DONE_NAME).is_file():
+        return False, ""
+    review_state = _review_state_snapshot(task.task_id)
+    if _review_attribution_required(task, review_state) and _review_attribution_issue(
+        task.review_text, review_state
+    ):
+        return False, ""
+    return True, verdict
+
+
+def _review_terminal_verdict(task: Task) -> str:
+    terminal, verdict = _review_terminal_state(task)
+    return verdict if terminal else ""
+
+
+def _quarantine_invalid_review(
+    task: Task, *, reason: str = "invalid"
+) -> Optional[Path]:
+    """把无效/半份/冒名审查移入 对接/审查历史/，不删除。
+
+    署名错误使用 invalid-attribution-<时间>.md，其余沿用 invalid-<时间>.md。
+    """
+    if task.archived:
+        return None
+    review_path = task.docking_dir / REVIEW_NAME
+    review_done_path = task.docking_dir / REVIEW_DONE_NAME
+    if not review_path.is_file() and not review_done_path.is_file():
+        return None
+    history_dir = task.docking_dir / REVIEW_HISTORY_DIRNAME
+    history_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix = (
+        REVIEW_ATTRIBUTION_HISTORY_PREFIX
+        if reason == "attribution"
+        else "invalid"
+    )
+    moved: Optional[Path] = None
+    if review_path.is_file():
+        moved = _unique_history_path(history_dir, f"{prefix}-{stamp}.md")
+        shutil.move(str(review_path), str(moved))
+    if review_done_path.is_file():
+        done_target = _unique_history_path(
+            history_dir, f"{prefix}-{stamp}-{REVIEW_DONE_NAME}"
+        )
+        shutil.move(str(review_done_path), str(done_target))
+    return moved
+
+
+def _review_round_incomplete(task: Task, state: Dict[str, object]) -> bool:
+    """本轮审核失败时，判断文件是否构成无效/半份（旧有效结论不动）。"""
+    review_path = task.docking_dir / REVIEW_NAME
+    if not review_path.is_file():
+        return False
+    try:
+        review_text = _read_text(review_path)
+    except OSError:
+        return False
+    if _review_verdict(review_text) not in {"passed", "revise"}:
+        return True
+    if not _artifact_updated(review_path, state.get("baseline_review")):
+        # 仍是上一轮的有效审查：保留，供人工核对。
+        return False
+    review_done_path = task.docking_dir / REVIEW_DONE_NAME
+    if not review_done_path.is_file():
+        return True
+    return not _artifact_updated(
+        review_done_path, state.get("baseline_review_done")
+    )
+
+
+def _quarantine_review_round(task: Task, state: Dict[str, object]) -> None:
+    latest = _find_task(task.task_id) or task
+    if not _review_round_incomplete(latest, state):
+        return
+    try:
+        _quarantine_invalid_review(latest)
+    except OSError:
+        traceback.print_exc()
+
+
 def _task_phase(task: Task) -> str:
-    """阶段判定顺序：交接阻塞 → 继续修正中 → 审查结论 → 审核中 → 交付 → 分发。"""
+    """阶段顺序：交接阻塞 → 修正推进 → 运行中 → 审核终态 → 交付 → 分发。
+
+    运行中的审核/分发优先于旧的审查文件，避免新一轮运行期间误报终态。
+    """
     if _handoff_blocked_for(task.task_id):
         return PHASE_HANDOFF_BLOCKED
     advance_state = _advance_state_snapshot(task.task_id)
@@ -4145,17 +5258,16 @@ def _task_phase(task: Task) -> str:
         ) == "running":
             step = str(revise_state.get("step") or "")
             return PHASE_REVIEWING if step == "review" else PHASE_DISPATCHING
-    if task.review_path is not None:
-        return PHASE_REVISE if _review_verdict(task.review_text) == "revise" else PHASE_PASSED
     if _active_review_task() == task.task_id or _review_active_for(task.task_id):
         return PHASE_REVIEWING
+    if _active_dispatch_task() == task.task_id:
+        return PHASE_DISPATCHING
+    terminal, verdict = _review_terminal_state(task)
+    if terminal:
+        return PHASE_REVISE if verdict == "revise" else PHASE_PASSED
     delivered, _reason = _delivery_evidence(task)
     if delivered:
         return PHASE_REVIEW_READY
-    if _active_dispatch_task() == task.task_id:
-        return PHASE_DISPATCHING
-    if any(item.status in {"pending", "failed"} for item in task.subtasks):
-        return PHASE_UNDISPATCHED
     return PHASE_UNDISPATCHED
 
 
@@ -4201,17 +5313,31 @@ def _review_role_binding() -> Tuple[Optional[Role], Optional[AgentApp], str]:
     return role, agent, ""
 
 
-def _review_prompt(task: Task) -> str:
+def _review_prompt(
+    task: Task,
+    role: Optional[Role] = None,
+    agent: Optional[AgentApp] = None,
+) -> str:
     project_dir = task.project_dir
     workdir = task.workdir
+    if role is None or agent is None:
+        bound_role, bound_agent, _binding_issue = _review_role_binding()
+        role = role or bound_role
+        agent = agent or bound_agent
+    role_name = role.name if role is not None else REVIEW_ROLE_ID
+    agent_id = agent.id if agent is not None else "未绑定"
+    attribution = _review_attribution_header(role_name, agent_id)
+    output_dirs = {
+        item.id: _subtask_output_dir(task, item) for item in task.subtasks
+    }
     done_lines = "\n".join(
-        f"  - {workdir}/子任务/{item.id}/DONE.md（{item.id} · {item.title}）"
+        f"  - {output_dirs[item.id] / DONE_NAME}（{item.id} · {item.title}）"
         for item in task.subtasks
     )
     if done_lines:
         subtask_guide = (
             "· 读 `对接/任务单.md`、`对接/subtasks.yaml`、每个\n"
-            "  `工作区/子任务/<子任务id>/DONE.md` 及 workdir 中的产物：\n"
+            "  子任务输出目录（绝对路径）下的 DONE.md 及产物：\n"
         )
     else:
         subtask_guide = (
@@ -4233,11 +5359,18 @@ def _review_prompt(task: Task) -> str:
         f"  - {project_dir}/对接/subtasks.yaml（如存在）\n"
         f"{delivery_lines}"
         f"{done_lines}\n"
-        f"  - 工作区：{task.workspace_dir}\n"
+        f"  - 工作目录/产物根（绝对路径）：{workdir}\n"
         "· 按任务单的验收标准逐条核：功能、边界、证据\n"
         f"· 写 `对接/审查.md`（绝对路径：{review_path}）："
         "结论（**通过** 或 **须修正**）+ 逐项证据 + 问题清单\n"
         f"· 写 `对接/审核完成.md`（绝对路径：{review_done_path}）作为完成信号\n"
+        "· ★ 审查.md 开头必须原样写入下面两行（角色与 Agent 不得改写）：\n"
+        f"{attribution}"
+        "· 头部第三行写实际结论（二选一）：`- 结论：**通过**` 或 "
+        "`- 结论：**须修正**`；不要照抄本提示行。\n"
+        "· ★ 不得自称 AI-A，也不得在审查中出现 `AI-A` 字样；"
+        "任务单/历史材料中的 AI-A 也不要摘录进审查文件；"
+        "否则整份审查会被拒收并移入 对接/审查历史/invalid-attribution-*.md。\n"
         "· ★ 只允许审核角色写 审查.md；不得改子任务产物；不删文件\n"
         "完成后退出。"
     )
@@ -4267,8 +5400,11 @@ def _review_availability(task: Task) -> Tuple[bool, str]:
     delivered, evidence = _delivery_evidence(task)
     if not delivered:
         return False, evidence + "；没有可审核的交付物。"
-    if task.review_path is not None:
-        return False, "对接/审查.md 已存在，已有审核结论。"
+    terminal, _verdict = _review_terminal_state(task)
+    if terminal:
+        return False, "对接/审查.md 与 审核完成.md 已构成审核终态。"
+    # 空/半份/结论不可识别的审查不构成终态：保留重试入口，
+    # 真正重试时由 _start_review 移入 对接/审查历史/invalid-<时间>.md。
     if _review_active_for(task.task_id):
         return False, "审核进行中，请等待当前审核结束。"
     if _active_dispatch_task():
@@ -4306,12 +5442,21 @@ def _review_status_payload(task: Task) -> Dict[str, object]:
     running = state_name == "running" and _review_active_for(task.task_id)
     if running:
         phase = PHASE_REVIEWING
-    verdict = _review_verdict(task.review_text)
+    terminal, verdict = _review_terminal_state(task)
     handoff_blocked = _handoff_blocked_for(task.task_id)
-    if task.review_path is not None and not running and not handoff_blocked:
+    if terminal and not running and not handoff_blocked:
         state_name = "completed"
-    if state_name == "completed" and task.review_path is None:
-        state_name = "idle"
+    if not terminal and not handoff_blocked and not running:
+        if task.review_path is not None:
+            if state_name in {"completed", "idle"}:
+                state_name = "review_failed"
+                state["message"] = (
+                    "对接/审查.md 缺少可识别结论或 审核完成.md 完成信号；"
+                    "可重新审核，旧文件会移入 对接/审查历史/invalid-<时间>.md。"
+                )
+                state["error"] = state["message"]
+        elif state_name == "completed":
+            state_name = "idle"
     can_start, reason = _review_availability(task)
     role, agent, binding_issue = _review_role_binding()
     review_done_path = task.docking_dir / REVIEW_DONE_NAME
@@ -4320,8 +5465,8 @@ def _review_status_payload(task: Task) -> Dict[str, object]:
     total = len(task.subtasks)
     done = task.subtasks_done
     delivered, delivery_evidence = _delivery_evidence(task)
-    conclusion = verdict or str(state.get("conclusion") or "")
-    if task.review_path is not None and not verdict:
+    conclusion = verdict if terminal and not running else ""
+    if not terminal:
         conclusion = ""
     return {
         "ok": True,
@@ -4362,6 +5507,8 @@ def _review_status_payload(task: Task) -> Dict[str, object]:
         "review_agent": agent.id if agent is not None else "",
         "review_agent_name": agent.name if agent is not None else "",
         "review_binding_error": binding_issue,
+        "attribution_required": bool(state.get("attribution_required")),
+        "attribution_issue": str(state.get("attribution_issue") or ""),
         "handoff_blocked": _handoff_blocked_for(task.task_id),
         "handoff": _handoff_state_snapshot(task.task_id),
         "handoff_status_url": f"/api/task/{task.task_id}/handoff-status",
@@ -4398,7 +5545,7 @@ def _review_worker(
                 agent=spec,
                 round_no=1,
                 workdir=task.workdir,
-                prompt=_review_prompt(task),
+                prompt=_review_prompt(task, role, agent),
                 kind="review",
                 log_prefix="review",
                 cwd=task.project_dir,
@@ -4443,6 +5590,7 @@ def _review_worker(
                 review_done_baseline=state.get("baseline_review_done"),
             )
             if not bool(handoff.get("passed")):
+                _quarantine_review_round(task, state)
                 _review_commit(
                     state,
                     state="review_failed",
@@ -4489,40 +5637,71 @@ def _review_worker(
                 message="本轮审核没有更新 审查.md，可重试。",
             )
             return
-        if not review_done_path.is_file():
+        attribution_issue = _review_attribution_issue(review_text, state)
+        if attribution_issue:
+            moved: Optional[Path] = None
+            try:
+                moved = _quarantine_invalid_review(task, reason="attribution")
+            except OSError:
+                traceback.print_exc()
+            detail = _review_attribution_message(attribution_issue)
+            quarantine_note = (
+                f"已移入 {_display_path(moved)}。" if moved is not None else ""
+            )
             _review_commit(
                 state,
                 state="review_failed",
                 finished_at=_now_iso(),
                 log=log,
-                conclusion=verdict,
-                error="已写 对接/审查.md，但缺少 对接/审核完成.md 完成信号。",
+                conclusion="",
+                error=(detail + "；" + quarantine_note).strip("；")[:2_000],
+                message=(
+                    "审查署名无效，已拒收；"
+                    + (quarantine_note or "请人工核对 对接/审查.md。")
+                ),
+                quarantined_review=_display_path(moved) if moved else "",
+                attribution_issue=attribution_issue,
+            )
+            return
+        if not review_done_path.is_file():
+            _quarantine_review_round(task, state)
+            _review_commit(
+                state,
+                state="review_failed",
+                finished_at=_now_iso(),
+                log=log,
+                conclusion="",
+                error="已写 对接/审查.md，但缺少 对接/审核完成.md 完成信号；"
+                "半份审查已移入 对接/审查历史/。",
                 message="审核完成信号缺失，可重试或人工核对。",
             )
             return
         if not _artifact_updated(
             review_done_path, state.get("baseline_review_done")
         ):
+            _quarantine_review_round(task, state)
             _review_commit(
                 state,
                 state="review_failed",
                 finished_at=_now_iso(),
                 log=log,
-                conclusion=verdict,
+                conclusion="",
                 error=(
                     "对接/审核完成.md 仍是上一轮的完成信号，"
-                    "本轮审核没有重新写入。"
+                    "本轮审核没有重新写入；半份审查已移入 对接/审查历史/。"
                 ),
                 message="本轮审核没有更新完成信号，可重试。",
             )
             return
         if not verdict:
+            _quarantine_review_round(task, state)
             _review_commit(
                 state,
                 state="review_failed",
                 finished_at=_now_iso(),
                 log=log,
-                error="对接/审查.md 没有可识别的结论（通过 / 须修正）。",
+                error="对接/审查.md 没有可识别的结论（通过 / 须修正）；"
+                "无效审查已移入 对接/审查历史/。",
                 message="审查结论无法识别，可重试或人工核对。",
             )
             return
@@ -4568,6 +5747,13 @@ def _start_review(
     """预检通过后启动审核线程；任何预检失败都不启动进程。"""
     global ACTIVE_REVIEW
     with REVIEW_START_LOCK:
+        if _advance_owned and _advance_stop_requested():
+            raise ActionError(
+                409,
+                "推进已请求停止",
+                "用户已请求停止全自动推进；本次没有启动审核 Agent。",
+                "等待停止完成后刷新页面。",
+            )
         if ACTIVE_REVIEW is not None:
             active_task = str(ACTIVE_REVIEW.get("task") or "")
             raise ActionError(
@@ -4576,13 +5762,23 @@ def _start_review(
                 f"{active_task or '另一个任务'} 正在审核；同一时刻只允许一个审核。",
                 "等待当前审核结束后再试。",
             )
-        if task.archived:
-            raise ActionError(
-                409,
-                "归档任务只读",
-                f"{task.task_id} 位于 归档/，不能审核。",
-                "先从归档库恢复项目。",
-            )
+        with _task_lifecycle_lock(task.task_id):
+            current = _find_task(task.task_id)
+            if current is None:
+                raise ActionError(
+                    409,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
+                )
+            if current.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能审核。",
+                    "先从归档库恢复项目。",
+                )
+            task = current
         _ensure_handoff_not_blocked(task)
         if not _advance_owned:
             active_advance = _active_advance_task()
@@ -4601,7 +5797,9 @@ def _start_review(
                 "等待分发结束后再审核。",
             )
         if task.subtasks_path.is_file():
-            subtasks, error = _load_subtasks(task.subtasks_path)
+            subtasks, error = _load_subtasks(
+                task.subtasks_path, task.task_id
+            )
             if error:
                 raise ActionError(
                     400,
@@ -4626,11 +5824,14 @@ def _start_review(
                 evidence + "；未启动任何进程。",
                 "等待子任务交付、任务级 DONE.md 或工作区产物出现后再审核。",
             )
-        if task.review_path is not None and not _allow_existing_review:
+        terminal, _terminal_verdict = _review_terminal_state(task)
+        if terminal and not _allow_existing_review:
             raise ActionError(
                 409,
                 "已有审核结论",
-                f"{task.task_id} 的 对接/审查.md 已存在，本次没有启动任何进程。",
+                f"{task.task_id} 的 对接/{REVIEW_NAME} 与 "
+                f"对接/{REVIEW_DONE_NAME} 已构成审核终态，"
+                "本次没有启动任何进程。",
                 "查看现有审查意见；如需重审，请先人工处理 对接/审查.md。",
             )
         role, agent, binding_issue = _review_role_binding()
@@ -4672,59 +5873,201 @@ def _start_review(
         if not bool(handoff.get("passed")):
             raise _handoff_action_error(handoff)
 
-        state: Dict[str, object] = {
-            "ok": True,
-            "task": task.task_id,
-            "state": "running",
-            "role": role.id,
-            "role_name": role.name,
-            "agent": agent.id,
-            "agent_name": agent.name,
-            "started_at": _now_iso(),
-            "finished_at": "",
-            "conclusion": "",
-            "message": (
-                "重新审核中… 正在复核修正后的产物与证据。"
-                if _allow_existing_review
-                else "审核中… 正在由审核角色复核全部子任务。"
-            ),
-            "log": "",
-            "error": "",
-            "allow_existing_review": bool(_allow_existing_review),
-            "baseline_review": _file_signature(
-                task.docking_dir / REVIEW_NAME
-            ),
-            "baseline_review_done": _file_signature(
-                task.docking_dir / REVIEW_DONE_NAME
-            ),
-        }
-        initial_state = copy.deepcopy(state)
-        thread = threading.Thread(
-            target=_review_worker,
-            args=(task, role, agent, state),
-            name=f"review-{task.task_id}",
-            daemon=True,
-        )
-        with REVIEW_STATE_LOCK:
-            ACTIVE_REVIEW = {"task": task.task_id, "state": state}
-            _write_review_state_file(state)
-        try:
-            thread.start()
-        except RuntimeError as exc:
+        with _task_lifecycle_lock(task.task_id):
+            latest = _find_task(task.task_id)
+            if latest is None:
+                raise ActionError(
+                    409,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
+                )
+            if latest.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能审核。",
+                    "先从归档库恢复项目。",
+                )
+            task = latest
+            if _active_dispatch_task():
+                raise ActionError(
+                    409,
+                    "分发正在运行",
+                    f"{_active_dispatch_task()} 正在分发实现；本次没有启动任何进程。",
+                    "等待分发结束后再审核。",
+                )
+            if ACTIVE_REGISTRATIONS:
+                raise ActionError(
+                    409,
+                    "总控登记正在运行",
+                    "已有总控登记占用执行器；本次没有启动任何进程。",
+                    "等待登记结束后再审核。",
+                )
+            if not _advance_owned:
+                active_advance = _active_advance_task()
+                if active_advance:
+                    raise ActionError(
+                        409,
+                        "全自动推进正在运行",
+                        f"{active_advance} 的全自动推进占用执行器；"
+                        "本次没有启动任何进程。",
+                        "等待推进结束后再手动审核。",
+                    )
+            active_handoff = _active_handoff_task()
+            if active_handoff:
+                raise ActionError(
+                    409,
+                    "交接体检正在运行",
+                    f"{active_handoff} 正在检查/补交交接文件；"
+                    "本次没有启动任何进程。",
+                    "等待交接体检结束后再审核。",
+                )
+            try:
+                lock = _runner().lock_info()
+            except Exception:
+                lock = {}
+            if lock.get("active"):
+                raise ActionError(
+                    409,
+                    "执行器正忙",
+                    f"执行器正在运行 {lock.get('task') or '未知任务'}；"
+                    "本次没有启动任何进程。",
+                    "等待当前运行结束后再审核。",
+                )
+            if _handoff_blocked_for(task.task_id):
+                raise ActionError(
+                    409,
+                    "交接体检未通过",
+                    "交接体检已阻塞，本次没有启动审核。",
+                    "先补齐缺件或重试体检。",
+                )
+            waiting = _review_ready_subtasks(task)
+            if waiting:
+                raise ActionError(
+                    409,
+                    "审核预检未通过",
+                    "以下子任务尚未全部交付（须为 delivered），未启动任何进程："
+                    + "、".join(waiting),
+                    "先完成分发实现，等待全部子任务交付后再审核。",
+                )
+            delivered, evidence = _delivery_evidence(task)
+            if not delivered:
+                raise ActionError(
+                    409,
+                    "还没有可审核的交付",
+                    evidence + "；未启动任何进程。",
+                    "等待子任务交付、任务级 DONE.md 或工作区产物出现后再审核。",
+                )
+            terminal, _terminal_verdict = _review_terminal_state(task)
+            if terminal and not _allow_existing_review:
+                raise ActionError(
+                    409,
+                    "已有审核结论",
+                    f"{task.task_id} 的 对接/{REVIEW_NAME} 与 "
+                    f"对接/{REVIEW_DONE_NAME} 已构成审核终态，"
+                    "本次没有启动任何进程。",
+                    "查看现有审查意见；如需重审，请先人工处理 对接/审查.md。",
+                )
+            role, agent, binding_issue = _review_role_binding()
+            if binding_issue or role is None or agent is None:
+                detail = binding_issue or "审核角色不可用"
+                title = (
+                    "审核角色未绑定" if "未绑定" in detail else "审核角色不可用"
+                )
+                raise ActionError(
+                    409,
+                    title,
+                    detail + "；本次没有启动任何进程。",
+                    "到 /roles/reviewer 绑定一个已登记且可执行的 Agent。",
+                    violations=[detail],
+                )
+
+            quarantined = ""
+            terminal, _terminal_verdict = _review_terminal_state(task)
+            if task.review_path is not None and not terminal:
+                previous_state = _review_state_snapshot(task.task_id)
+                attribution_issue = ""
+                if _review_attribution_required(task, previous_state):
+                    attribution_issue = _review_attribution_issue(
+                        task.review_text, previous_state
+                    )
+                try:
+                    moved = _quarantine_invalid_review(
+                        task,
+                        reason="attribution" if attribution_issue else "invalid",
+                    )
+                except OSError as exc:
+                    raise ActionError(
+                        500,
+                        "无效审查无法隔离",
+                        f"无法把不完整的 对接/{REVIEW_NAME} 移入 "
+                        f"{REVIEW_HISTORY_DIRNAME}/：{exc}；本次没有启动任何进程。",
+                        "检查对接目录写权限后重试。",
+                    ) from exc
+                quarantined = _display_path(moved) if moved is not None else ""
+                refreshed = _find_task(task.task_id)
+                if refreshed is not None:
+                    task = refreshed
+
+            state: Dict[str, object] = {
+                "ok": True,
+                "task": task.task_id,
+                "state": "running",
+                "role": role.id,
+                "role_name": role.name,
+                "agent": agent.id,
+                "agent_name": agent.name,
+                "attribution_required": True,
+                "attribution_role": role.id,
+                "attribution_role_name": role.name,
+                "attribution_agent": agent.id,
+                "started_at": _now_iso(),
+                "finished_at": "",
+                "conclusion": "",
+                "message": (
+                    "重新审核中… 正在复核修正后的产物与证据。"
+                    if _allow_existing_review
+                    else "审核中… 正在由审核角色复核全部子任务。"
+                ),
+                "log": "",
+                "error": "",
+                "quarantined_review": quarantined,
+                "allow_existing_review": bool(_allow_existing_review),
+                "baseline_review": _file_signature(
+                    task.docking_dir / REVIEW_NAME
+                ),
+                "baseline_review_done": _file_signature(
+                    task.docking_dir / REVIEW_DONE_NAME
+                ),
+            }
+            initial_state = copy.deepcopy(state)
+            thread = threading.Thread(
+                target=_review_worker,
+                args=(task, role, agent, state),
+                name=f"review-{task.task_id}",
+                daemon=True,
+            )
             with REVIEW_STATE_LOCK:
-                ACTIVE_REVIEW = None
-                state["state"] = "review_failed"
-                state["message"] = f"审核线程无法启动：{exc}"
-                state["finished_at"] = _now_iso()
-                state["error"] = str(exc)
+                ACTIVE_REVIEW = {"task": task.task_id, "state": state}
                 _write_review_state_file(state)
-            raise ActionError(
-                500,
-                "审核未能启动",
-                f"审核线程无法启动：{exc}",
-                "查看控制台终端错误信息后重试。",
-            ) from exc
-        return initial_state
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                with REVIEW_STATE_LOCK:
+                    ACTIVE_REVIEW = None
+                    state["state"] = "review_failed"
+                    state["message"] = f"审核线程无法启动：{exc}"
+                    state["finished_at"] = _now_iso()
+                    state["error"] = str(exc)
+                    _write_review_state_file(state)
+                raise ActionError(
+                    500,
+                    "审核未能启动",
+                    f"审核线程无法启动：{exc}",
+                    "查看控制台终端错误信息后重试。",
+                ) from exc
+            return initial_state
 
 
 # ---------------------------------------------------------------------------
@@ -4809,6 +6152,8 @@ def _advance_state_snapshot(task_id: str) -> Dict[str, object]:
 
 def _advance_commit(advance_state: Dict[str, object], **updates: object) -> None:
     with ADVANCE_STATE_LOCK:
+        if advance_state.get("force_stopped"):
+            return
         advance_state.update(updates)
         _write_advance_state_file(advance_state)
 
@@ -4817,6 +6162,8 @@ def _advance_note(
     advance_state: Dict[str, object], message: str, *, step: str = ""
 ) -> None:
     with ADVANCE_STATE_LOCK:
+        if advance_state.get("force_stopped"):
+            return
         if step:
             advance_state["step"] = step
             advance_state["step_label"] = ADVANCE_STEP_LABELS.get(step, step)
@@ -4837,6 +6184,181 @@ def _advance_note(
         _write_advance_state_file(advance_state)
 
 
+def _advance_budget_limits(state: Dict[str, object]) -> Dict[str, float]:
+    raw = state.get("budget")
+    if not isinstance(raw, dict):
+        raw = {}
+    def _number(key: str, default: float) -> float:
+        try:
+            value = float(raw.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.0, value)
+    return {
+        "max_runtime_seconds": _number(
+            "max_runtime_seconds", ADVANCE_MAX_RUNTIME_SECONDS
+        ),
+        "max_subtasks": _number("max_subtasks", ADVANCE_MAX_SUBTASKS),
+        "max_revise_rounds": _number(
+            "max_revise_rounds", ADVANCE_MAX_REVISE_ROUNDS
+        ),
+    }
+
+
+def _advance_started_epoch(state: Dict[str, object]) -> float:
+    try:
+        value = float(state.get("started_epoch") or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value > 0:
+        return value
+    started_at = str(state.get("started_at") or "")
+    if started_at:
+        try:
+            return datetime.fromisoformat(started_at).timestamp()
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _advance_budget_snapshot(state: Dict[str, object]) -> Dict[str, object]:
+    limits = _advance_budget_limits(state)
+    started_epoch = _advance_started_epoch(state)
+    runtime = max(0.0, time.time() - started_epoch) if started_epoch else 0.0
+    try:
+        subtasks = int(state.get("subtasks_started") or 0)
+    except (TypeError, ValueError):
+        subtasks = 0
+    try:
+        revise_round = int(state.get("revise_round") or 0)
+    except (TypeError, ValueError):
+        revise_round = 0
+    violations: List[str] = []
+    if (
+        limits["max_runtime_seconds"] > 0
+        and runtime >= limits["max_runtime_seconds"]
+    ):
+        violations.append(
+            "运行时长超限：已运行 "
+            f"{runtime:.0f} 秒，上限 {limits['max_runtime_seconds']:.0f} 秒"
+        )
+    if limits["max_subtasks"] > 0 and subtasks > limits["max_subtasks"]:
+        violations.append(
+            f"子任务超限：已启动 {subtasks} 个，"
+            f"上限 {limits['max_subtasks']:.0f} 个"
+        )
+    if (
+        limits["max_revise_rounds"] > 0
+        and revise_round > limits["max_revise_rounds"]
+    ):
+        violations.append(
+            f"修订轮次超限：第 {revise_round} 轮，"
+            f"上限 {limits['max_revise_rounds']:.0f} 轮"
+        )
+    diagnosed = str(state.get("budget_violation") or "").strip()
+    if diagnosed and diagnosed not in violations:
+        violations.insert(0, diagnosed)
+    return {
+        "limits": limits,
+        "used": {
+            "runtime_seconds": round(runtime, 1),
+            "subtasks": subtasks,
+            "revise_round": revise_round,
+        },
+        "exceeded": bool(violations),
+        "reason": "；".join(violations),
+    }
+
+
+def _advance_budget_stop_reason(
+    state: Dict[str, object],
+    *,
+    planned_subtasks: int = 0,
+    revise_round: Optional[int] = None,
+) -> str:
+    snapshot = _advance_budget_snapshot(state)
+    if snapshot["exceeded"]:
+        return str(snapshot["reason"])
+    limits = snapshot["limits"]
+    assert isinstance(limits, dict)
+    used = snapshot["used"]
+    assert isinstance(used, dict)
+    if (
+        planned_subtasks > 0
+        and limits["max_subtasks"] > 0
+        and int(used["subtasks"]) + planned_subtasks
+        > int(limits["max_subtasks"])
+    ):
+        return (
+            "子任务预算超出：本次推进已启动 "
+            f"{used['subtasks']} 个，准备再启动 {planned_subtasks} 个，"
+            f"上限 {limits['max_subtasks']:.0f} 个"
+        )
+    if (
+        revise_round is not None
+        and limits["max_revise_rounds"] > 0
+        and revise_round > limits["max_revise_rounds"]
+    ):
+        return (
+            f"修订轮次预算超出：第 {revise_round} 轮，"
+            f"上限 {limits['max_revise_rounds']:.0f} 轮"
+        )
+    return ""
+
+
+def _advance_stop_requested() -> bool:
+    with ADVANCE_STATE_LOCK:
+        if ACTIVE_ADVANCE is None:
+            return False
+        state = ACTIVE_ADVANCE.get("state")
+        if not isinstance(state, dict):
+            return False
+        return bool(state.get("stop_requested"))
+
+
+def _active_advance_abort(task_id: str = "") -> Tuple[str, str]:
+    """当前活动的推进是否要求中止；供交接补交等同步步骤检查。"""
+    with ADVANCE_STATE_LOCK:
+        if ACTIVE_ADVANCE is None:
+            return "", ""
+        if (
+            task_id
+            and str(ACTIVE_ADVANCE.get("task") or "").upper()
+            != task_id.strip().upper()
+        ):
+            return "", ""
+        state = ACTIVE_ADVANCE.get("state")
+        if not isinstance(state, dict):
+            return "", ""
+        return _advance_abort_reason(state)
+
+
+def _advance_abort_reason(
+    advance_state: Dict[str, object],
+) -> Tuple[str, str]:
+    """返回 (stopped|stopped_with_budget, 原因)；空串表示继续。"""
+    with ADVANCE_STATE_LOCK:
+        if advance_state.get("stop_requested"):
+            return "stopped", "用户请求停止全自动推进"
+        budget_reason = _advance_budget_stop_reason(advance_state)
+    if budget_reason:
+        return "stopped_with_budget", budget_reason
+    return "", ""
+
+
+def _stop_active_runner_for_task(task_id: str, reason: str) -> bool:
+    try:
+        stopped = _runner().stop_active(reason, task_id=task_id)
+    except Exception:
+        traceback.print_exc()
+        stopped = False
+    try:
+        _runner().release_stale_lock_for_task(task_id)
+    except Exception:
+        traceback.print_exc()
+    return stopped
+
+
 def _advance_finish(
     advance_state: Dict[str, object],
     state_name: str,
@@ -4846,6 +6368,19 @@ def _advance_finish(
     conclusion: str = "",
     handoff: Optional[Dict[str, object]] = None,
 ) -> None:
+    if advance_state.get("force_stopped"):
+        return
+    if state_name == "stopped_with_budget" and error:
+        advance_state["budget_violation"] = error
+    if (
+        advance_state.get("stop_requested")
+        and state_name in {"failed", "handoff_blocked"}
+    ):
+        state_name = "stopped"
+        message = "用户已请求停止；当前步骤已终止，执行器锁已释放。"
+        error = ""
+        conclusion = ""
+        handoff = None
     updates: Dict[str, object] = {
         "state": state_name,
         "step": "done",
@@ -4854,6 +6389,8 @@ def _advance_finish(
         "error": error[:2_000],
         "conclusion": conclusion,
         "finished_at": _now_iso(),
+        "budget": _advance_budget_snapshot(advance_state),
+        "stop_requested": bool(advance_state.get("stop_requested")),
     }
     if handoff is not None:
         updates.update(
@@ -4902,9 +6439,13 @@ def _advance_availability(task: Task) -> Tuple[bool, str]:
         return False, "交接体检未通过；请先点「重试体检」或人工补齐缺件。"
     if _active_handoff_task():
         return False, "交接体检或自动补交正在进行，请等待结束。"
-    if task.review_path is not None:
-        verdict = "通过" if _review_verdict(task.review_text) != "revise" else "须修正"
-        return False, f"任务已有审核结论（{verdict}），无需再次推进。"
+    terminal, terminal_verdict = _review_terminal_state(task)
+    if terminal:
+        verdict = "须修正" if terminal_verdict == "revise" else "通过"
+        return False, (
+            f"任务已有审核结论（{verdict}；终态需 审查.md + 审核完成.md），"
+            "无需再次推进。"
+        )
     active_advance = _active_advance_task()
     if active_advance:
         if active_advance.upper() == task.task_id:
@@ -4987,10 +6528,25 @@ def _advance_finish_handoff(
 
 
 def _wait_for_dispatch_finish(
-    task_id: str, timeout: float
+    task_id: str,
+    timeout: float,
+    advance_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[bool, Dict[str, object]]:
     deadline = time.monotonic() + max(1.0, timeout)
     while time.monotonic() < deadline:
+        if advance_state is not None:
+            abort_state, abort_reason = _advance_abort_reason(advance_state)
+            if abort_state:
+                _stop_active_runner_for_task(task_id, abort_reason)
+                snapshot = dict(_dispatch_state_snapshot(task_id))
+                snapshot.update(
+                    {
+                        "aborted": True,
+                        "abort_state": abort_state,
+                        "abort_reason": abort_reason,
+                    }
+                )
+                return False, snapshot
         state = _dispatch_state_snapshot(task_id)
         snapshot = dict(state)
         if str(snapshot.get("state") or "") in {"completed", "failed"}:
@@ -5001,10 +6557,25 @@ def _wait_for_dispatch_finish(
 
 
 def _wait_for_review_finish(
-    task_id: str, timeout: float
+    task_id: str,
+    timeout: float,
+    advance_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[bool, Dict[str, object]]:
     deadline = time.monotonic() + max(1.0, timeout)
     while time.monotonic() < deadline:
+        if advance_state is not None:
+            abort_state, abort_reason = _advance_abort_reason(advance_state)
+            if abort_state:
+                _stop_active_runner_for_task(task_id, abort_reason)
+                snapshot = dict(_review_state_snapshot(task_id))
+                snapshot.update(
+                    {
+                        "aborted": True,
+                        "abort_state": abort_state,
+                        "abort_reason": abort_reason,
+                    }
+                )
+                return False, snapshot
         state = _review_state_snapshot(task_id)
         snapshot = dict(state)
         if str(snapshot.get("state") or "") in {"completed", "review_failed"}:
@@ -5012,6 +6583,23 @@ def _wait_for_review_finish(
                 return True, snapshot
         time.sleep(0.08)
     return False, _review_state_snapshot(task_id)
+
+
+def _wait_runner_idle_for_advance(
+    runner: runner_engine.Runner,
+    task_id: str,
+    advance_state: Dict[str, object],
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + max(1.0, timeout)
+    while time.monotonic() < deadline:
+        if runner.wait_for_idle(0.15):
+            return True
+        abort_state, abort_reason = _advance_abort_reason(advance_state)
+        if abort_state:
+            _stop_active_runner_for_task(task_id, abort_reason)
+            return False
+    return runner.wait_for_idle(0.0)
 
 
 def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
@@ -5027,7 +6615,25 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                     error=f"任务 {task_id} 不在活动项目目录中。",
                 )
                 return
-            if _registration_aware(task) and _registration_structure_incomplete(task):
+            abort_state, abort_reason = _advance_abort_reason(advance_state)
+            if abort_state:
+                _stop_active_runner_for_task(task_id, abort_reason)
+                _advance_finish(
+                    advance_state,
+                    abort_state,
+                    (
+                        "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                        if abort_state == "stopped"
+                        else "推进预算用尽，已停止：" + abort_reason
+                    ),
+                    error="" if abort_state == "stopped" else abort_reason,
+                )
+                return
+            if (
+                not advance_state.get("whole_rework")
+                and _registration_aware(task)
+                and _registration_structure_incomplete(task)
+            ):
                 _advance_note(
                     advance_state,
                     "登记交接文件不完整，正在回叫总控补交…",
@@ -5036,47 +6642,299 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                 handoff = _run_handoff_gates(
                     task, "dispatch", source="advance"
                 )
+                abort_state, abort_reason = _advance_abort_reason(advance_state)
+                if abort_state:
+                    _stop_active_runner_for_task(task_id, abort_reason)
+                    _advance_finish(
+                        advance_state,
+                        abort_state,
+                        (
+                            "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                            if abort_state == "stopped"
+                            else "推进预算用尽，已停止：" + abort_reason
+                        ),
+                        error="" if abort_state == "stopped" else abort_reason,
+                    )
+                    return
                 if not bool(handoff.get("passed")):
                     _advance_finish_handoff(advance_state, handoff)
                     return
                 continue
 
-            if task.review_path is not None and not advance_state.get("revise"):
-                verdict = _review_verdict(task.review_text)
-                if verdict == "revise":
+            if bool(advance_state.get("whole_rework")) and not bool(
+                advance_state.get("whole_ran")
+            ):
+                round_no = max(
+                    1,
+                    int(
+                        advance_state.get("revise_round")
+                        or task.revise_round
+                        or 1
+                    ),
+                )
+                context = advance_state.get("revise_context")
+                if not isinstance(context, dict):
+                    context = {}
+                _owner_role, owner_agent, owner_issue = _owner_role_binding(task)
+                if _owner_role is None or owner_agent is None:
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        "整单重修无法开始："
+                        + (owner_issue or "owner_role 不可用"),
+                        error=owner_issue or "owner_role 不可用",
+                    )
+                    return
+                done_raw = str(context.get("done_path") or "")
+                done_path = (
+                    Path(done_raw)
+                    if done_raw
+                    else _whole_rework_done_path(task, round_no)
+                )
+                snapshot_path = str(context.get("review_snapshot") or "")
+                prompt = _whole_rework_prompt(
+                    task,
+                    _owner_role,
+                    round_no,
+                    snapshot_path,
+                    done_path,
+                    context,
+                )
+                budget_reason = _advance_budget_stop_reason(
+                    advance_state,
+                    planned_subtasks=1,
+                    revise_round=round_no,
+                )
+                if budget_reason:
+                    _advance_finish(
+                        advance_state,
+                        "stopped_with_budget",
+                        "推进预算用尽，已停止：" + budget_reason,
+                        error=budget_reason,
+                    )
+                    return
+                _advance_commit(
+                    advance_state,
+                    subtasks_started=int(
+                        advance_state.get("subtasks_started") or 0
+                    )
+                    + 1,
+                )
+                _advance_note(
+                    advance_state,
+                    f"整单重修中… 回叫 owner_role={task.owner_role} 重做整单。",
+                    step="dispatch",
+                )
+                spec = runner_engine.AgentSpec(
+                    id=owner_agent.id,
+                    name=owner_agent.name,
+                    command=owner_agent.command,
+                    args_template=owner_agent.args_template,
+                )
+                log_prefix = (
+                    "rework-"
+                    + re.sub(r"[^A-Za-z0-9_-]+", "_", task.task_id)[:20]
+                    + f"-r{round_no}"
+                )
+                try:
+                    runner = _runner()
+                    launched = runner.launch(
+                        task_id=task.task_id,
+                        task_dir=task.project_dir,
+                        agent=spec,
+                        round_no=round_no,
+                        workdir=task.workdir,
+                        prompt=prompt,
+                        kind="whole_rework",
+                        log_prefix=log_prefix,
+                    )
+                    finished = _wait_runner_idle_for_advance(
+                        runner,
+                        task.task_id,
+                        advance_state,
+                        runner.timeout_seconds + 120.0,
+                    )
+                    final = dict(runner.snapshot())
+                except Exception as exc:
+                    abort_state, abort_reason = _advance_abort_reason(
+                        advance_state
+                    )
+                    if abort_state:
+                        _advance_finish(
+                            advance_state,
+                            abort_state,
+                            (
+                                "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                                if abort_state == "stopped"
+                                else "推进预算用尽，已停止：" + abort_reason
+                            ),
+                            error=""
+                            if abort_state == "stopped"
+                            else abort_reason,
+                        )
+                        return
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        f"整单重修未能启动或收尾：{exc}",
+                        error=str(exc),
+                    )
+                    return
+                abort_state, abort_reason = _advance_abort_reason(advance_state)
+                if abort_state:
+                    _advance_finish(
+                        advance_state,
+                        abort_state,
+                        (
+                            "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                            if abort_state == "stopped"
+                            else "推进预算用尽，已停止：" + abort_reason
+                        ),
+                        error="" if abort_state == "stopped" else abort_reason,
+                    )
+                    return
+                result_state = (
+                    str(final.get("state") or "failed")
+                    if finished
+                    else "failed"
+                )
+                error = str(final.get("error") or "")
+                if not finished:
+                    error = "等待整单重修收尾超时。"
+                elif result_state != "success" and not error:
+                    error = f"Agent 以 {result_state} 状态结束。"
+                if result_state != "success":
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        "整单重修失败，全自动推进已停止：" + error,
+                        error=error,
+                    )
+                    return
+                if not done_path.is_file():
+                    error = f"整单重修结束但没有写 {done_path}"
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        error,
+                        error=error,
+                    )
+                    return
+                try:
+                    done_text = _read_text(done_path)
+                except OSError as exc:
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        f"无法读取整单重修 DONE.md：{exc}",
+                        error=str(exc),
+                    )
+                    return
+                absent = [
+                    marker
+                    for marker in HANDOFF_REQUIRED_DONE_MARKERS
+                    if marker not in done_text
+                ]
+                if absent:
+                    error = (
+                        f"{done_path.name} 缺少章节："
+                        + "/".join(HANDOFF_REQUIRED_DONE_MARKERS)
+                        + f"（缺 {'、'.join(absent)}）"
+                    )
+                    _advance_finish(
+                        advance_state,
+                        "failed",
+                        error,
+                        error=error,
+                    )
+                    return
+                _advance_commit(
+                    advance_state,
+                    whole_ran=True,
+                    whole_done_path=_display_path(done_path),
+                    whole_run_id=str(launched.get("run_id") or ""),
+                    whole_log=str(final.get("log") or launched.get("log") or ""),
+                )
+                _advance_note(
+                    advance_state,
+                    "整单重修已写新 DONE.md，准备自动审核。",
+                    step="review",
+                )
+                continue
+
+            terminal, terminal_verdict = _review_terminal_state(task)
+            if terminal and not advance_state.get("revise"):
+                if terminal_verdict == "revise":
                     _advance_finish(
                         advance_state,
                         "stopped",
                         "审核结论为「须修正」；已停止，等待人工处理。",
                         conclusion="revise",
                     )
-                elif verdict == "passed":
+                else:
                     _advance_finish(
                         advance_state,
                         "completed",
                         "审核结论为「通过」；全自动推进完成。",
                         conclusion="passed",
                     )
-                else:
-                    _advance_finish(
-                        advance_state,
-                        "failed",
-                        "对接/审查.md 已存在，但无法识别结论；已停止。",
-                        error="审查结论无法识别（通过 / 须修正）。",
-                    )
                 return
 
             targets = _dispatch_targets(task)
             if targets:
+                budget_reason = _advance_budget_stop_reason(
+                    advance_state, planned_subtasks=len(targets)
+                )
+                if budget_reason:
+                    _advance_finish(
+                        advance_state,
+                        "stopped_with_budget",
+                        "推进预算用尽，已停止：" + budget_reason,
+                        error=budget_reason,
+                    )
+                    return
+                _advance_commit(
+                    advance_state,
+                    subtasks_started=int(
+                        advance_state.get("subtasks_started") or 0
+                    )
+                    + len(targets),
+                )
                 _advance_note(
                     advance_state,
                     "正在继续分发 "
                     f"{len(targets)} 个待开始/失败子任务…",
                     step="dispatch",
                 )
+                revise_context = advance_state.get("revise_context")
                 try:
-                    _start_dispatch(task, _advance_owned=True)
+                    _start_dispatch(
+                        task,
+                        _advance_owned=True,
+                        revise_context=(
+                            revise_context
+                            if isinstance(revise_context, dict)
+                            else None
+                        ),
+                    )
                 except ActionError as exc:
+                    abort_state, abort_reason = _advance_abort_reason(
+                        advance_state
+                    )
+                    if abort_state:
+                        _advance_finish(
+                            advance_state,
+                            abort_state,
+                            (
+                                "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                                if abort_state == "stopped"
+                                else "推进预算用尽，已停止：" + abort_reason
+                            ),
+                            error=""
+                            if abort_state == "stopped"
+                            else abort_reason,
+                        )
+                        return
                     handoff = exc.extra.get("handoff")
                     if isinstance(handoff, dict) and str(
                         handoff.get("state") or ""
@@ -5091,6 +6949,23 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                     )
                     return
                 except Exception as exc:
+                    abort_state, abort_reason = _advance_abort_reason(
+                        advance_state
+                    )
+                    if abort_state:
+                        _advance_finish(
+                            advance_state,
+                            abort_state,
+                            (
+                                "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                                if abort_state == "stopped"
+                                else "推进预算用尽，已停止：" + abort_reason
+                            ),
+                            error=""
+                            if abort_state == "stopped"
+                            else abort_reason,
+                        )
+                        return
                     _advance_finish(
                         advance_state,
                         "failed",
@@ -5104,7 +6979,22 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                     * max(1, len(targets))
                     + 60.0
                 )
-                completed, final = _wait_for_dispatch_finish(task_id, timeout)
+                completed, final = _wait_for_dispatch_finish(
+                    task_id, timeout, advance_state
+                )
+                abort_state, abort_reason = _advance_abort_reason(advance_state)
+                if abort_state:
+                    _advance_finish(
+                        advance_state,
+                        abort_state,
+                        (
+                            "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                            if abort_state == "stopped"
+                            else "推进预算用尽，已停止：" + abort_reason
+                        ),
+                        error="" if abort_state == "stopped" else abort_reason,
+                    )
+                    return
                 if not completed:
                     _advance_finish(
                         advance_state,
@@ -5198,6 +7088,19 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                     _allow_existing_review=bool(advance_state.get("revise")),
                 )
             except ActionError as exc:
+                abort_state, abort_reason = _advance_abort_reason(advance_state)
+                if abort_state:
+                    _advance_finish(
+                        advance_state,
+                        abort_state,
+                        (
+                            "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                            if abort_state == "stopped"
+                            else "推进预算用尽，已停止：" + abort_reason
+                        ),
+                        error="" if abort_state == "stopped" else abort_reason,
+                    )
+                    return
                 handoff = exc.extra.get("handoff")
                 if isinstance(handoff, dict) and str(
                     handoff.get("state") or ""
@@ -5212,6 +7115,19 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                 )
                 return
             except Exception as exc:
+                abort_state, abort_reason = _advance_abort_reason(advance_state)
+                if abort_state:
+                    _advance_finish(
+                        advance_state,
+                        abort_state,
+                        (
+                            "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                            if abort_state == "stopped"
+                            else "推进预算用尽，已停止：" + abort_reason
+                        ),
+                        error="" if abort_state == "stopped" else abort_reason,
+                    )
+                    return
                 _advance_finish(
                     advance_state,
                     "failed",
@@ -5221,8 +7137,21 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                 return
 
             completed, final = _wait_for_review_finish(
-                task_id, RUNNER_TIMEOUT_SECONDS + 180.0
+                task_id, RUNNER_TIMEOUT_SECONDS + 180.0, advance_state
             )
+            abort_state, abort_reason = _advance_abort_reason(advance_state)
+            if abort_state:
+                _advance_finish(
+                    advance_state,
+                    abort_state,
+                    (
+                        "用户停止推进；当前步骤已终止，执行器锁已释放。"
+                        if abort_state == "stopped"
+                        else "推进预算用尽，已停止：" + abort_reason
+                    ),
+                    error="" if abort_state == "stopped" else abort_reason,
+                )
+                return
             if not completed:
                 _advance_finish(
                     advance_state,
@@ -5240,21 +7169,26 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
 
             review_completed = str(final.get("state") or "") == "completed"
             refreshed = _find_task(task_id)
-            if (
-                review_completed
-                and refreshed is not None
-                and refreshed.review_path is not None
-            ):
-                verdict = _review_verdict(refreshed.review_text)
+            terminal, verdict = (
+                _review_terminal_state(refreshed)
+                if refreshed is not None
+                else (False, "")
+            )
+            if review_completed and refreshed is not None and terminal:
                 if verdict == "revise":
                     _advance_finish(
                         advance_state,
                         "stopped",
                         (
-                            "继续修正完成，但审核结论仍为「须修正」；"
+                            "整单重修完成，但审核结论仍为「须修正」；"
                             "已停止，可进行下一轮修正。"
-                            if advance_state.get("revise")
-                            else "审核结论为「须修正」；已停止，等待人工处理。"
+                            if advance_state.get("whole_rework")
+                            else (
+                                "继续修正完成，但审核结论仍为「须修正」；"
+                                "已停止，可进行下一轮修正。"
+                                if advance_state.get("revise")
+                                else "审核结论为「须修正」；已停止，等待人工处理。"
+                            )
                         ),
                         conclusion="revise",
                     )
@@ -5264,9 +7198,13 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                         advance_state,
                         "completed",
                         (
-                            "继续修正完成，审核结论为「通过」。"
-                            if advance_state.get("revise")
-                            else "审核结论为「通过」；全自动推进完成。"
+                            "整单重修完成，审核结论为「通过」。"
+                            if advance_state.get("whole_rework")
+                            else (
+                                "继续修正完成，审核结论为「通过」。"
+                                if advance_state.get("revise")
+                                else "审核结论为「通过」；全自动推进完成。"
+                            )
                         ),
                         conclusion="passed",
                     )
@@ -5315,87 +7253,222 @@ def _start_advance(
     *,
     auto: bool = False,
     revise: bool = False,
+    whole_rework: bool = False,
     _prechecked: bool = False,
     revise_round: int = 0,
     strategy: str = "",
     affected_ids: Optional[List[str]] = None,
     revise_log: str = "",
+    revise_context: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """预检后启动全自动推进线程；预检失败不会启动任何进程。"""
     global ACTIVE_ADVANCE
-    with ADVANCE_START_LOCK:
-        if ACTIVE_ADVANCE is not None:
-            active_task = str(ACTIVE_ADVANCE.get("task") or "")
-            raise ActionError(
-                409,
-                "已有全自动推进在跑",
-                f"{active_task or '另一个任务'} 正在全自动推进；"
-                "同一时刻只允许一个全自动推进。",
-                "等待当前推进结束后再试。",
-            )
-        if not _prechecked:
-            if revise:
-                available, reason = _revise_availability(task)
-            else:
-                available, reason = _advance_availability(task)
-            if not available:
+    with _task_lifecycle_lock(task.task_id):
+        with ADVANCE_START_LOCK:
+            current = _find_task(task.task_id)
+            if current is None:
                 raise ActionError(
                     409,
-                    "无法全自动推进",
-                    reason,
-                    "处理阻塞原因后重试；也可以手动分发或审核。",
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
                 )
+            if current.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能全自动推进。",
+                    "先从归档库恢复项目。",
+                )
+            task = current
+            if ACTIVE_ADVANCE is not None:
+                active_task = str(ACTIVE_ADVANCE.get("task") or "")
+                raise ActionError(
+                    409,
+                    "已有全自动推进在跑",
+                    f"{active_task or '另一个任务'} 正在全自动推进；"
+                    "同一时刻只允许一个全自动推进。",
+                    "等待当前推进结束后再试。",
+                )
+            if not _prechecked:
+                if revise:
+                    available, reason = _revise_availability(task)
+                else:
+                    available, reason = _advance_availability(task)
+                if not available:
+                    raise ActionError(
+                        409,
+                        "无法全自动推进",
+                        reason,
+                        "处理阻塞原因后重试；也可以手动分发或审核。",
+                    )
 
-        state: Dict[str, object] = {
-            "ok": True,
-            "task": task.task_id,
-            "state": "running",
-            "step": "starting",
-            "step_label": ADVANCE_STEP_LABELS["starting"],
-            "auto": bool(auto),
-            "revise": bool(revise),
-            "revise_round": max(0, int(revise_round)),
-            "revise_strategy": strategy,
-            "revise_targets": list(affected_ids or []),
-            "revise_log": revise_log,
-            "started_at": _now_iso(),
-            "finished_at": "",
-            "message": (
-                "继续修正已启动，准备重新分发/审核…"
-                if revise
-                else "全自动推进已启动，准备分发/审核…"
-            ),
-            "error": "",
-            "conclusion": "",
-            "events": [],
-        }
-        initial_state = copy.deepcopy(state)
-        thread = threading.Thread(
-            target=_advance_worker,
-            args=(task.task_id, state),
-            name=f"advance-{task.task_id}",
-            daemon=True,
-        )
-        with ADVANCE_STATE_LOCK:
-            ACTIVE_ADVANCE = {"task": task.task_id, "state": state}
-            _write_advance_state_file(state)
-        try:
-            thread.start()
-        except RuntimeError as exc:
+            effective_round = max(
+                int(revise_round),
+                int(task.revise_round or 0),
+                0,
+            )
+            started_epoch = time.time()
+            state: Dict[str, object] = {
+                "ok": True,
+                "task": task.task_id,
+                "state": "running",
+                "step": "starting",
+                "step_label": ADVANCE_STEP_LABELS["starting"],
+                "auto": bool(auto),
+                "revise": bool(revise),
+                "whole_rework": bool(whole_rework),
+                "whole_ran": False,
+                "revise_round": effective_round,
+                "revise_strategy": strategy,
+                "revise_targets": list(affected_ids or []),
+                "revise_log": revise_log,
+                "revise_context": dict(revise_context or {}),
+                "started_at": _now_iso(),
+                "started_epoch": started_epoch,
+                "finished_at": "",
+                "subtasks_started": 0,
+                "stop_requested": False,
+                "stop_requested_at": "",
+                "budget": {
+                    "max_runtime_seconds": ADVANCE_MAX_RUNTIME_SECONDS,
+                    "max_subtasks": ADVANCE_MAX_SUBTASKS,
+                    "max_revise_rounds": ADVANCE_MAX_REVISE_ROUNDS,
+                },
+                "message": (
+                    "整单重修已启动，准备回叫 owner_role 并自动审核…"
+                    if whole_rework
+                    else (
+                        "继续修正已启动，准备重新分发/审核…"
+                        if revise
+                        else "全自动推进已启动，准备分发/审核…"
+                    )
+                ),
+                "error": "",
+                "conclusion": "",
+                "events": [],
+            }
+            initial_state = copy.deepcopy(state)
+            thread = threading.Thread(
+                target=_advance_worker,
+                args=(task.task_id, state),
+                name=f"advance-{task.task_id}",
+                daemon=True,
+            )
             with ADVANCE_STATE_LOCK:
-                ACTIVE_ADVANCE = None
-                state["state"] = "failed"
-                state["finished_at"] = _now_iso()
-                state["message"] = f"全自动推进线程无法启动：{exc}"
-                state["error"] = str(exc)
+                ACTIVE_ADVANCE = {"task": task.task_id, "state": state}
                 _write_advance_state_file(state)
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                with ADVANCE_STATE_LOCK:
+                    ACTIVE_ADVANCE = None
+                    state["state"] = "failed"
+                    state["finished_at"] = _now_iso()
+                    state["message"] = f"全自动推进线程无法启动：{exc}"
+                    state["error"] = str(exc)
+                    _write_advance_state_file(state)
+                raise ActionError(
+                    500,
+                    "全自动推进未能启动",
+                    f"全自动推进线程无法启动：{exc}",
+                    "查看控制台终端错误信息后重试。",
+                ) from exc
+            return initial_state
+
+
+def _stop_advance(task_id: str) -> Dict[str, object]:
+    """用户显式停止全自动推进：终止当前 Agent，等待线程收尾并确认锁释放。"""
+    global ACTIVE_ADVANCE
+    task_id = task_id.strip().upper()
+    with ADVANCE_STATE_LOCK:
+        active = ACTIVE_ADVANCE
+        if active is None or str(active.get("task") or "").upper() != task_id:
             raise ActionError(
-                500,
-                "全自动推进未能启动",
-                f"全自动推进线程无法启动：{exc}",
-                "查看控制台终端错误信息后重试。",
-            ) from exc
-        return initial_state
+                409,
+                "没有正在进行的全自动推进",
+                f"{task_id} 当前没有运行中的全自动推进，未终止任何进程。",
+                "刷新页面查看当前状态。",
+            )
+        state = active.get("state")
+        if not isinstance(state, dict) or str(state.get("state") or "") != "running":
+            raise ActionError(
+                409,
+                "全自动推进不在运行中",
+                f"{task_id} 的推进已经结束或正在收尾，未重复终止。",
+                "刷新页面查看最终状态。",
+            )
+        state["stop_requested"] = True
+        state["stop_requested_at"] = _now_iso()
+        state["message"] = "已请求停止全自动推进，正在终止当前步骤…"
+        events = state.get("events")
+        if not isinstance(events, list):
+            events = []
+            state["events"] = events
+        events.append(
+            {
+                "at": _now_iso(),
+                "step": str(state.get("step") or ""),
+                "message": "收到「停止推进」请求。",
+            }
+        )
+        if len(events) > 40:
+            del events[:-40]
+        _write_advance_state_file(state)
+
+    reason = "用户停止全自动推进"
+    deadline = time.monotonic() + 20.0
+    next_stop = 0.0
+    while time.monotonic() < deadline:
+        if _active_advance_task().upper() != task_id:
+            break
+        now = time.monotonic()
+        if now >= next_stop:
+            _stop_active_runner_for_task(task_id, reason)
+            next_stop = now + 0.5
+        time.sleep(0.05)
+
+    final = _advance_state_snapshot(task_id)
+    if str(final.get("state") or "") == "running":
+        # 推进线程卡在不可中断的同步步骤：强制收口并阻止后续写入。
+        with ADVANCE_STATE_LOCK:
+            active = ACTIVE_ADVANCE
+            if active is not None and str(active.get("task") or "").upper() == task_id:
+                state = active.get("state")
+                if isinstance(state, dict):
+                    state.update(
+                        {
+                            "state": "stopped",
+                            "step": "done",
+                            "step_label": ADVANCE_STEP_LABELS["done"],
+                            "message": (
+                                "用户停止推进；推进线程未在 20 秒内退出，"
+                                "已强制收口并释放执行器锁。"
+                            ),
+                            "error": "",
+                            "conclusion": "",
+                            "finished_at": _now_iso(),
+                            "budget": _advance_budget_snapshot(state),
+                            "stop_requested": True,
+                        }
+                    )
+                    _write_advance_state_file(state)
+                    state["force_stopped"] = True
+                ACTIVE_ADVANCE = None
+        _stop_active_runner_for_task(task_id, reason)
+        final = _advance_state_snapshot(task_id)
+
+    _stop_active_runner_for_task(task_id, reason)
+    try:
+        lock = _runner().lock_info()
+    except Exception:
+        lock = {}
+    final = dict(final)
+    final["lock_released"] = not (
+        bool(lock.get("active"))
+        and str(lock.get("task") or "").upper() == task_id
+    )
+    return final
 
 
 def _record_auto_advance_failure(task_id: str, message: str, *, auto: bool = True) -> None:
@@ -5481,6 +7554,7 @@ def _advance_status_payload(task: Task) -> Dict[str, object]:
         reason = "全自动推进正在进行，请等待当前步骤结束。"
     phase = _task_phase(task)
     terminal = state_name in ADVANCE_TERMINAL_STATES
+    budget = _advance_budget_snapshot(state)
     events = state.get("events")
     if not isinstance(events, list):
         events = []
@@ -5499,8 +7573,17 @@ def _advance_status_payload(task: Task) -> Dict[str, object]:
         "state_tone": ADVANCE_STATE_TONES.get(state_name, "idle"),
         "running": running,
         "terminal": terminal,
+        "can_stop": running,
+        "stop_url": f"/advance/{task.task_id}/stop",
+        "stop_requested": bool(state.get("stop_requested")),
+        "stopped_with_budget": state_name == "stopped_with_budget",
+        "budget": budget,
         "auto": bool(state.get("auto")),
         "revise": bool(state.get("revise")),
+        "whole_rework": bool(state.get("whole_rework")),
+        "whole_ran": bool(state.get("whole_ran")),
+        "whole_done_path": str(state.get("whole_done_path") or ""),
+        "owner_role": task.owner_role,
         "revise_round": _meta_int(state.get("revise_round")),
         "revise_strategy": str(state.get("revise_strategy") or ""),
         "revise_targets": state.get("revise_targets")
@@ -5634,10 +7717,10 @@ def _complete_review_after_handoff(task_id: str) -> None:
     if not bool(state.get("handoff_blocked")):
         return
     task = _find_task(task_id)
-    if task is None or task.review_path is None:
+    if task is None:
         return
-    verdict = _review_verdict(task.review_text)
-    if not verdict:
+    terminal, verdict = _review_terminal_state(task)
+    if not terminal:
         return
     with REVIEW_STATE_LOCK:
         state["state"] = "completed"
@@ -5737,6 +7820,96 @@ def _revise_next_round(task: Task) -> int:
     return task.revise_round + 1
 
 
+def _owner_role_binding(task: Task) -> Tuple[Optional[Role], Optional[AgentApp], str]:
+    """整单重修的责任角色：task.yaml 的 owner_role（缺省 designer）。"""
+    role_id = str(task.owner_role or DEFAULT_OWNER_ROLE).strip() or DEFAULT_OWNER_ROLE
+    role = _find_role(role_id)
+    if role is None:
+        return None, None, f"owner_role={role_id} 不存在（请改 task.yaml 或角色页）"
+    if not role.enabled:
+        return role, None, f"owner_role 角色 {role.name}（{role.id}）已停用"
+    if not role.agent_id:
+        return role, None, f"owner_role 角色 {role.name}（{role.id}）未绑定 Agent"
+    agents, _agent_issues = _load_agents()
+    agent = next((item for item in agents if item.id == role.agent_id), None)
+    if agent is None:
+        return role, None, (
+            f"owner_role 角色 {role.name} 绑定的 Agent {role.agent_id} 未登记"
+        )
+    if not agent.installed:
+        return role, agent, (
+            f"owner_role 绑定的 Agent {agent.id} 未安装（installed=false）"
+        )
+    if not agent.currently_executable:
+        return role, agent, (
+            f"owner_role 绑定的 Agent {agent.id} 命令当前不可执行"
+        )
+    return role, agent, ""
+
+
+def _whole_rework_done_path(task: Task, round_no: int) -> Path:
+    """整单重修的新 DONE.md：对接/交付/r<轮次>/DONE.md；已存在则加时间戳。"""
+    root = task.docking_dir / DELIVERY_DIRNAME
+    name = f"r{max(1, int(round_no))}"
+    candidate = root / name
+    if candidate.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        candidate = root / f"{name}-{stamp}"
+        suffix = 1
+        while candidate.exists():
+            candidate = root / f"{name}-{stamp}-{suffix}"
+            suffix += 1
+    return candidate / DONE_NAME
+
+
+def _whole_rework_prompt(
+    task: Task,
+    role: Role,
+    round_no: int,
+    review_snapshot: str,
+    done_path: Path,
+    context: Dict[str, object],
+) -> str:
+    """整单重修提示词：任务单、问题全文、禁止事项、轮次、回归验收。"""
+    try:
+        task_sheet = _read_text(task.path)
+    except OSError:
+        task_sheet = "（任务单不可读）"
+    issues = str(context.get("issues_full") or "").strip()
+    if not issues:
+        issues = task.review_text.strip() or "（审查未提供问题清单）"
+    prohibitions = str(
+        context.get("prohibitions") or _task_sheet_prohibitions(task)
+    ).strip()
+    snapshot = review_snapshot or "（无历史快照）"
+    return (
+        f"你是 {role.name}（{role.id}）。任务 {task.task_id}「{task.title}」"
+        f"进入{REVISE_MODE_LABELS[REVISE_MODE_WHOLE]}（第 {round_no} 轮）。\n"
+        f"值班台项目目录：{task.project_dir}\n"
+        f"工作目录（cwd）：{task.workdir}\n"
+        f"任务单（绝对路径）：{task.path}\n"
+        f"上一轮审查快照（绝对路径）：{snapshot}\n"
+        "\n"
+        "=== 任务单全文（必须逐条满足） ===\n"
+        f"{task_sheet}\n"
+        "=== 本轮审查问题全文（原文，必须逐条修正） ===\n"
+        f"{issues}\n"
+        "=== 父任务单「禁止事项」全文 ===\n"
+        f"{prohibitions}\n"
+        "\n"
+        "=== 回归验收要求 ===\n"
+        f"- 轮次：第 {round_no}/{MAX_REVISE_ROUNDS} 轮；只写本轮允许的范围。\n"
+        "- 重做后必须重新满足任务单全部验收标准，并逐条对应上面的问题。\n"
+        f"- 完成后必须写新的 DONE.md（绝对路径）：{done_path}\n"
+        "  DONE.md 必须含「做了什么 / 怎么验 / 结果」三部分；"
+        "「怎么验」写清本轮复跑命令与结果。\n"
+        "- 不得回退上一轮已通过的内容，不得缩小原有验收范围。\n"
+        "- 只写工作目录内产物与上述 DONE.md；不得写 对接/审查.md；"
+        "不得删除文件、不改其它项目、不重启 8787。\n"
+        "完成后退出；系统会自动重新审核。"
+    )
+
+
 def _revise_availability(task: Task) -> Tuple[bool, str]:
     if task.archived:
         return False, "归档任务只读，不能继续修正。"
@@ -5746,7 +7919,10 @@ def _revise_availability(task: Task) -> Tuple[bool, str]:
         return False, "交接体检或自动补交正在进行，请等待结束。"
     if task.review_path is None:
         return False, "还没有审核结论，没有需要继续修正的内容。"
-    if _review_verdict(task.review_text) != "revise":
+    terminal, verdict = _review_terminal_state(task)
+    if not terminal:
+        return False, "审查缺少可识别结论或 审核完成.md，没有可继续修正的终态。"
+    if verdict != "revise":
         return False, "当前审查结论不是「须修正」，无需继续修正。"
     if task.revise_round >= MAX_REVISE_ROUNDS:
         return False, f"已达 {MAX_REVISE_ROUNDS} 轮修正上限，请人工介入。"
@@ -5793,6 +7969,14 @@ def _revise_availability(task: Task) -> Tuple[bool, str]:
             f"执行器正忙（{lock.get('task') or '未知任务'}），"
             "请等待当前运行结束。"
         )
+    if not task.subtasks:
+        owner_role, _owner_agent, owner_issue = _owner_role_binding(task)
+        if owner_issue:
+            return False, "整单重修无法开始：" + owner_issue
+        return True, (
+            f"本任务没有子任务；将回叫 owner_role={owner_role.id if owner_role else task.owner_role}"
+            " 绑定的 Agent 整单重修，完成后自动重新审核。"
+        )
     if targets:
         return True, (
             "将重置问题清单涉及的子任务，然后自动分发并重新审核；"
@@ -5803,6 +7987,7 @@ def _revise_availability(task: Task) -> Tuple[bool, str]:
 
 def _revise_status_payload(task: Task) -> Dict[str, object]:
     plan = _revise_plan(task)
+    terminal, terminal_verdict = _review_terminal_state(task)
     advance_state = _advance_state_snapshot(task.task_id)
     revise_state = advance_state if advance_state.get("revise") else {}
     running = _revise_active_for(task.task_id)
@@ -5821,6 +8006,9 @@ def _revise_status_payload(task: Task) -> Dict[str, object]:
     if running and step == "dispatch":
         current_subtask = str(dispatch_state.get("current_subtask") or "")
         current_title = str(dispatch_state.get("current_title") or "")
+        if not task.subtasks:
+            current_subtask = f"整单 · {task.owner_role or DEFAULT_OWNER_ROLE}"
+            current_title = "owner_role Agent 重做整单"
     log = str(revise_state.get("revise_log") or "")
     log_url = f"/log?path={quote(log, safe='')}" if log else ""
     target_ids = plan["target_ids"]
@@ -5851,14 +8039,16 @@ def _revise_status_payload(task: Task) -> Dict[str, object]:
         "can_start": can_start,
         "disabled_reason": "" if can_start else reason,
         "ready_reason": reason if can_start else "",
-        "needs_choice": not target_ids,
+        "needs_choice": bool(task.subtasks) and not target_ids,
         "has_subtasks": bool(task.subtasks),
+        "whole_rework": not bool(task.subtasks),
+        "owner_role": task.owner_role,
         "target_ids": target_ids,
         "passed_target_ids": plan["passed_target_ids"],
         "all_ids": plan["all_ids"],
         "issues": plan["issues"],
         "has_issue_section": plan["has_issue_section"],
-        "review_conclusion": _review_verdict(task.review_text),
+        "review_conclusion": terminal_verdict if terminal else "",
         "log": log,
         "log_url": log_url,
         "events": events,
@@ -5914,27 +8104,110 @@ def _unique_history_path(directory: Path, name: str) -> Path:
     return candidate
 
 
-def _archive_revise_review(task: Task, round_no: int) -> Dict[str, str]:
-    """复制本轮审查（和完成信号）到 对接/审查历史/round-<n>.md；不删除原件。"""
+def _archive_revise_review(
+    task: Task, round_no: int, *, move: bool = False
+) -> Dict[str, str]:
+    """把本轮审查（和完成信号）归档到 对接/审查历史/round-<n>.md。
+
+    子任务重修默认复制（原件保留供核对）；无子任务整单重修必须 move，
+    否则旧终态会继续生效，无法进入新一轮审核。
+    """
     source = task.docking_dir / REVIEW_NAME
     if not source.is_file():
         raise ConfigError(f"没有找到 对接/{REVIEW_NAME}，无法归档旧审查。")
     history_dir = task.docking_dir / REVIEW_HISTORY_DIRNAME
     history_dir.mkdir(parents=True, exist_ok=True)
     review_target = _unique_history_path(history_dir, f"round-{round_no}.md")
-    shutil.copy2(source, review_target)
+    transfer = shutil.move if move else shutil.copy2
+    transfer(str(source), str(review_target))
     done_target = ""
     done_source = task.docking_dir / REVIEW_DONE_NAME
     if done_source.is_file():
         done_path = _unique_history_path(
             history_dir, f"round-{round_no}-{REVIEW_DONE_NAME}"
         )
-        shutil.copy2(done_source, done_path)
+        transfer(str(done_source), str(done_path))
         done_target = _display_path(done_path)
     return {
         "review": _display_path(review_target),
+        "review_abs": str(review_target.resolve()),
         "review_done": done_target,
         "directory": _display_path(history_dir),
+        "moved": bool(move),
+    }
+
+
+def _archive_subtask_outputs(
+    task: Task, subtask_ids: List[str], round_no: int
+) -> List[Dict[str, str]]:
+    """修订前把受影响子任务的 output_dir 整体移入工作区历史，保留不删。"""
+    if not subtask_ids:
+        return []
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    results: List[Dict[str, str]] = []
+    by_id = {item.id: item for item in task.subtasks}
+    for subtask_id in subtask_ids:
+        item = by_id.get(subtask_id)
+        if item is None:
+            continue
+        try:
+            source = _subtask_output_dir(task, item)
+        except ConfigError as exc:
+            raise ConfigError(f"{subtask_id} 输出目录不可用：{exc}") from exc
+        if not source.exists():
+            results.append(
+                {
+                    "id": subtask_id,
+                    "from": str(source),
+                    "to": "",
+                    "moved": False,
+                }
+            )
+            continue
+        base = (
+            task.workspace_dir
+            / HISTORY_DIRNAME
+            / SUBTASK_HISTORY_DIRNAME
+            / subtask_id
+        )
+        base.mkdir(parents=True, exist_ok=True)
+        target = _unique_history_path(
+            base, f"round-{round_no}-{stamp}"
+        )
+        try:
+            shutil.move(str(source), str(target))
+        except OSError as exc:
+            raise ConfigError(
+                f"无法把 {subtask_id} 的旧产物移入 {target}：{exc}"
+            ) from exc
+        results.append(
+            {
+                "id": subtask_id,
+                "from": str(source),
+                "to": str(target),
+                "moved": True,
+            }
+        )
+    return results
+
+
+def _build_revision_context(
+    task: Task, round_no: int, snapshot_path: str
+) -> Dict[str, object]:
+    """修订分发所需的不可丢失上下文；随 advance/dispatch 状态传递。"""
+    issues_full = _review_issue_section(task.review_text).strip()
+    if not issues_full:
+        # 没有标准「问题清单」标题时保留整份审查，避免上下文丢失。
+        issues_full = task.review_text.strip()
+    return {
+        "round": int(round_no),
+        "parent_task_sheet": str(Path(task.path).resolve()),
+        "prohibitions": _task_sheet_prohibitions(task),
+        "issues_full": issues_full,
+        "review_snapshot": (
+            str(Path(snapshot_path).resolve()) if snapshot_path else ""
+        ),
+        "review_verdict": "revise",
     }
 
 
@@ -5959,6 +8232,7 @@ def _reset_subtasks_for_revise(
                 "finished_at": "",
                 "error": "",
                 "log": "",
+                "run_id": "",
             },
         )
         changed.append(item.id)
@@ -5966,22 +8240,38 @@ def _reset_subtasks_for_revise(
 
 
 def _start_revise(task: Task, mode: str = "") -> Dict[str, object]:
-    """预检后归档旧审查、重置受影响子任务，并启动既有自动推进流程。"""
+    """预检后归档旧审查、重置受影响子任务，并启动既有自动推进流程。
+
+    无子任务（subtasks_total=0）时改走「整单重修」：移动旧审查到
+    对接/审查历史/round-<n>.md，回叫 owner_role 重做整单，再自动审核。
+    """
     with REVISE_START_LOCK:
-        if task.archived:
-            raise ActionError(
-                409,
-                "归档任务只读",
-                f"{task.task_id} 位于 归档/，不能继续修正。",
-                "先从归档库恢复项目。",
-            )
+        with _task_lifecycle_lock(task.task_id):
+            current = _find_task(task.task_id)
+            if current is None:
+                raise ActionError(
+                    409,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
+                )
+            if current.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能继续修正。",
+                    "先从归档库恢复项目。",
+                )
+            task = current
         _ensure_handoff_not_blocked(task)
-        if _review_verdict(task.review_text) != "revise" or task.review_path is None:
+        terminal, verdict = _review_terminal_state(task)
+        if not terminal or verdict != "revise":
             raise ActionError(
                 409,
                 "当前不是须修正阶段",
-                f"{task.task_id} 没有可继续修正的审查结论。",
-                "只有审查结论为「须修正」的任务可以继续修正。",
+                f"{task.task_id} 没有可继续修正的审查终态"
+                "（须同时具备 审查.md 明确结论与 审核完成.md）。",
+                "只有审查结论为「须修正」且完成信号齐备的任务可以继续修正。",
             )
         if task.revise_round >= MAX_REVISE_ROUNDS:
             raise ActionError(
@@ -6000,9 +8290,19 @@ def _start_revise(task: Task, mode: str = "") -> Dict[str, object]:
                 400,
                 "修正方式不正确",
                 f"未知的修正方式：{mode}。",
-                "使用 affected / all / review 之一。",
+                "使用 affected / all / review / whole 之一。",
             )
-        if not mode:
+        whole = not task.subtasks and mode != REVISE_MODE_REVIEW
+        if whole:
+            mode = REVISE_MODE_WHOLE
+        elif mode == REVISE_MODE_WHOLE and task.subtasks:
+            raise ActionError(
+                400,
+                "修正方式不正确",
+                "整单重修只适用于没有子任务的任务；本任务有 subtasks.yaml。",
+                "改用 affected / all / review。",
+            )
+        if not whole and not mode:
             if target_ids:
                 mode = REVISE_MODE_AFFECTED
             else:
@@ -6039,13 +8339,6 @@ def _start_revise(task: Task, mode: str = "") -> Dict[str, object]:
                     "all_ids": plan["all_ids"],
                 },
             )
-        if mode == REVISE_MODE_ALL and not task.subtasks:
-            raise ActionError(
-                409,
-                "没有可重做的子任务",
-                f"{task.task_id} 没有子任务清单，无法全部重做。",
-                "改为「只重新审核（不改产物）」，或人工处理。",
-            )
         if mode == REVISE_MODE_REVIEW:
             waiting = [
                 item
@@ -6075,185 +8368,361 @@ def _start_revise(task: Task, mode: str = "") -> Dict[str, object]:
         if not bool(handoff.get("passed")):
             raise _handoff_action_error(handoff)
 
-        ids = (
-            list(plan["all_ids"])
-            if mode == REVISE_MODE_ALL
-            else target_ids if mode == REVISE_MODE_AFFECTED else []
-        )
-        reset_ids = set(ids)
-        reset_statuses = (
-            {"delivered", "passed"}
-            if mode == REVISE_MODE_ALL
-            else {"delivered"}
-        )
-        post_targets = [
-            item
-            for item in task.subtasks
-            if item.status in {"pending", "failed"}
-            or (item.id in reset_ids and item.status in reset_statuses)
-        ]
-        if post_targets:
-            roles, _role_issues = _load_roles()
-            agents, _agent_issues = _load_agents()
-            _bindings, violations = _dispatch_preflight(
-                tuple(post_targets), roles, agents
-            )
-            if violations:
+        with _task_lifecycle_lock(task.task_id):
+            latest = _find_task(task.task_id)
+            if latest is None:
                 raise ActionError(
                     409,
-                    "分发预检未通过",
-                    "以下子任务的角色绑定不满足要求，未修改任何文件："
-                    + "；".join(violations),
-                    "到 /roles 绑定可执行 Agent，或修正 subtasks.yaml 的 agent_role。",
-                    violations=violations,
+                    "任务正在移动或已归档",
+                    f"{task.task_id} 已不在 项目/ 中，本次没有启动任何进程。",
+                    "刷新看板；归档任务请先恢复。",
+                )
+            if latest.archived:
+                raise ActionError(
+                    409,
+                    "归档任务只读",
+                    f"{task.task_id} 位于 归档/，不能继续修正。",
+                    "先从归档库恢复项目。",
+                )
+            task = latest
+            if _active_dispatch_task():
+                raise ActionError(
+                    409,
+                    "分发正在运行",
+                    f"{_active_dispatch_task()} 正在分发实现，未修改任何文件。",
+                    "等待分发结束后再继续修正。",
+                )
+            active_review = _active_review_task()
+            if active_review:
+                raise ActionError(
+                    409,
+                    "审核正在运行",
+                    f"{active_review} 正在审核，未修改任何文件。",
+                    "等待审核结束后再继续修正。",
+                )
+            active_handoff = _active_handoff_task()
+            if active_handoff:
+                raise ActionError(
+                    409,
+                    "交接体检正在运行",
+                    f"{active_handoff} 正在检查/补交交接文件，未修改任何文件。",
+                    "等待交接体检结束后再继续修正。",
+                )
+            if _active_advance_task():
+                raise ActionError(
+                    409,
+                    "全自动推进正在运行",
+                    f"{_active_advance_task()} 正在全自动推进，未修改任何文件。",
+                    "等待推进结束后再继续修正。",
+                )
+            if ACTIVE_REGISTRATIONS:
+                raise ActionError(
+                    409,
+                    "总控登记正在运行",
+                    "已有总控登记占用执行器，未修改任何文件。",
+                    "等待登记结束后再继续修正。",
+                )
+            try:
+                lock = _runner().lock_info()
+            except Exception:
+                lock = {}
+            if lock.get("active"):
+                raise ActionError(
+                    409,
+                    "执行器正忙",
+                    f"执行器正在运行 {lock.get('task') or '未知任务'}，"
+                    "未修改任何文件。",
+                    "等待当前运行结束后再继续修正。",
+                )
+            terminal, verdict = _review_terminal_state(task)
+            if not terminal or verdict != "revise":
+                raise ActionError(
+                    409,
+                    "当前不是须修正阶段",
+                    f"{task.task_id} 的审查终态在启动前发生变化，未修改任何文件。",
+                    "刷新后确认审查结论再试。",
+                )
+            if task.revise_round >= MAX_REVISE_ROUNDS:
+                raise ActionError(
+                    409,
+                    "已达修正轮次上限",
+                    f"{task.task_id} 已连续修正 {task.revise_round} 轮，"
+                    f"达到上限 {MAX_REVISE_ROUNDS} 轮；请人工介入。",
+                    "人工检查产物与审查意见后再决定下一步。",
+                )
+            plan = _revise_plan(task)
+            target_ids = list(plan["target_ids"])
+            whole = not task.subtasks and mode != REVISE_MODE_REVIEW
+            if whole:
+                mode = REVISE_MODE_WHOLE
+
+            ids = (
+                list(plan["all_ids"])
+                if mode == REVISE_MODE_ALL
+                else target_ids if mode == REVISE_MODE_AFFECTED else []
+            )
+            reset_ids = set(ids)
+            reset_statuses = (
+                {"delivered", "passed"}
+                if mode == REVISE_MODE_ALL
+                else {"delivered"}
+            )
+            post_targets = [
+                item
+                for item in task.subtasks
+                if item.status in {"pending", "failed"}
+                or (item.id in reset_ids and item.status in reset_statuses)
+            ]
+            if post_targets:
+                roles, _role_issues = _load_roles()
+                agents, _agent_issues = _load_agents()
+                _bindings, violations = _dispatch_preflight(
+                    tuple(post_targets), roles, agents
+                )
+                if violations:
+                    raise ActionError(
+                        409,
+                        "分发预检未通过",
+                        "以下子任务的角色绑定不满足要求，未修改任何文件："
+                        + "；".join(violations),
+                        "到 /roles 绑定可执行 Agent，或修正 subtasks.yaml 的 agent_role。",
+                        violations=violations,
+                    )
+            if whole:
+                _owner_role, _owner_agent, owner_issue = _owner_role_binding(task)
+                if owner_issue:
+                    raise ActionError(
+                        409,
+                        "整单重修无法开始",
+                        owner_issue + "；未修改任何文件。",
+                        "在任务详情编辑 owner_role，或到 /roles 绑定可执行 Agent。",
+                    )
+
+            round_no = _revise_next_round(task)
+            log_path = _new_revise_log_path(task)
+            log_rel = _display_path(log_path)
+            _append_revise_log(
+                log_path,
+                [
+                    f"# 继续修正 · {task.task_id} · 第 {round_no} 轮",
+                    f"- 时间：{_now_iso()}",
+                    f"- 任务：{task.task_id}「{task.title}」",
+                    f"- 修正方式：{REVISE_MODE_LABELS.get(mode, mode)}（{mode}）",
+                    f"- 审查结论：须修正",
+                    f"- 问题清单涉及：{'、'.join(target_ids) or '（未识别到子任务编号）'}",
+                    (
+                        f"- 本次计划范围：整单重修（owner_role={task.owner_role}）"
+                        if whole
+                        else f"- 本次计划范围：{'、'.join(ids) or '（不改产物）'}"
+                    ),
+                    f"- 修正轮次：{round_no}/{MAX_REVISE_ROUNDS}",
+                ],
+            )
+
+            try:
+                archived = _archive_revise_review(task, round_no, move=whole)
+            except (OSError, ConfigError) as exc:
+                _append_revise_log(log_path, [f"- 失败：旧审查归档失败：{exc}"])
+                raise ActionError(
+                    500,
+                    "旧审查归档失败",
+                    f"无法把 对接/{REVIEW_NAME} 归档到 "
+                    f"{REVIEW_HISTORY_DIRNAME}/：{exc}；未修改子任务。",
+                    "检查对接目录写权限后重试。",
+                ) from exc
+            revise_context = _build_revision_context(
+                task, round_no, str(archived.get("review_abs") or "")
+            )
+            _append_revise_log(
+                log_path,
+                [
+                    f"- 旧审查快照：{archived['review']}"
+                    f"（{'已移入' if whole else '已复制'}）",
+                    f"- 完成信号快照：{archived.get('review_done') or '（无）'}",
+                    f"- 修订上下文：父任务单={revise_context['parent_task_sheet']}",
+                    f"- 修订上下文：问题全文 {len(str(revise_context['issues_full']))} 字符；"
+                    f"禁止事项 {len(str(revise_context['prohibitions']))} 字符",
+                ],
+            )
+
+            archived_outputs: List[Dict[str, str]] = []
+            changed: List[str] = []
+            done_path = Path()
+            if whole:
+                done_path = _whole_rework_done_path(task, round_no)
+                revise_context["whole_rework"] = True
+                revise_context["owner_role"] = task.owner_role
+                revise_context["done_path"] = str(done_path.resolve())
+                revise_context["round"] = round_no
+                _append_revise_log(
+                    log_path,
+                    [
+                        f"- 整单重修：回叫 owner_role={task.owner_role} 绑定的 Agent",
+                        f"- 本轮新 DONE.md：{_display_path(done_path)}",
+                    ],
+                )
+            else:
+                moving_ids = [
+                    item.id
+                    for item in task.subtasks
+                    if item.id in set(ids)
+                    and (mode == REVISE_MODE_ALL or item.status != "passed")
+                ]
+                try:
+                    archived_outputs = _archive_subtask_outputs(
+                        task, moving_ids, round_no
+                    )
+                except ConfigError as exc:
+                    _append_revise_log(
+                        log_path, [f"- 失败：旧子任务产物无法移入历史：{exc}"]
+                    )
+                    raise ActionError(
+                        500,
+                        "旧产物无法移入历史",
+                        f"{exc}；旧审查已归档到 {archived['review']}，"
+                        "子任务尚未重置。",
+                        "检查工作区写权限后重试。",
+                    ) from exc
+                moved_count = sum(
+                    1 for item in archived_outputs if item.get("moved")
+                )
+                _append_revise_log(
+                    log_path,
+                    [
+                        f"- 旧产物移入工作区历史：{moved_count} 项"
+                        + (
+                            "（"
+                            + "、".join(
+                                item["id"]
+                                for item in archived_outputs
+                                if item.get("moved")
+                            )
+                            + "）"
+                            if moved_count
+                            else ""
+                        )
+                    ],
+                )
+                try:
+                    changed = _reset_subtasks_for_revise(
+                        task, ids, include_passed=(mode == REVISE_MODE_ALL)
+                    )
+                except ConfigError as exc:
+                    _append_revise_log(
+                        log_path, [f"- 失败：重置 subtasks.yaml 失败：{exc}"]
+                    )
+                    raise ActionError(
+                        500,
+                        "子任务无法重置",
+                        f"{exc}；旧审查已归档到 {archived['review']}。",
+                        "检查 对接/subtasks.yaml 后重试。",
+                    ) from exc
+                changed_ids = set(changed)
+                _append_revise_log(
+                    log_path,
+                    [
+                        f"- 重置为 pending：{'、'.join(changed) or '（无）'}",
+                        f"- 未改动的子任务："
+                        + (
+                            "、".join(
+                                item.id
+                                for item in task.subtasks
+                                if item.id not in changed_ids
+                            )
+                            or "（无）"
+                        ),
+                    ],
                 )
 
-        round_no = _revise_next_round(task)
-        log_path = _new_revise_log_path(task)
-        log_rel = _display_path(log_path)
-        _append_revise_log(
-            log_path,
-            [
-                f"# 继续修正 · {task.task_id} · 第 {round_no} 轮",
-                f"- 时间：{_now_iso()}",
-                f"- 任务：{task.task_id}「{task.title}」",
-                f"- 修正方式：{REVISE_MODE_LABELS.get(mode, mode)}（{mode}）",
-                f"- 审查结论：须修正",
-                f"- 问题清单涉及：{'、'.join(target_ids) or '（未识别到子任务编号）'}",
-                f"- 本次计划范围：{'、'.join(ids) or '（不改产物）'}",
-                f"- 修正轮次：{round_no}/{MAX_REVISE_ROUNDS}",
-            ],
-        )
+            try:
+                _write_revise_round(task, round_no)
+            except ConfigError as exc:
+                _append_revise_log(
+                    log_path, [f"- 失败：写入 revise_round 失败：{exc}"]
+                )
+                raise ActionError(
+                    500,
+                    "修正轮次无法写入",
+                    f"{exc}；旧审查已归档到 {archived['review']}。",
+                    "检查 对接/task.yaml 后重试。",
+                ) from exc
 
-        try:
-            archived = _archive_revise_review(task, round_no)
-        except (OSError, ConfigError) as exc:
-            _append_revise_log(log_path, [f"- 失败：旧审查归档失败：{exc}"])
-            raise ActionError(
-                500,
-                "旧审查归档失败",
-                f"无法复制 对接/{REVIEW_NAME} 到 {REVIEW_HISTORY_DIRNAME}/：{exc}；"
-                "未重置任何子任务。",
-                "检查对接目录写权限后重试。",
-            ) from exc
-        _append_revise_log(
-            log_path,
-            [
-                f"- 旧审查快照：{archived['review']}",
-                f"- 完成信号快照：{archived.get('review_done') or '（无）'}",
-            ],
-        )
-
-        try:
-            changed = _reset_subtasks_for_revise(
-                task, ids, include_passed=(mode == REVISE_MODE_ALL)
+            refreshed = _find_task(task.task_id)
+            if refreshed is None:
+                _append_revise_log(log_path, ["- 失败：重置后找不到任务。"])
+                raise ActionError(
+                    500,
+                    "找不到任务",
+                    f"{task.task_id} 在重置后不在活动项目目录中。",
+                    "检查项目目录是否被移动或归档。",
+                )
+            try:
+                advance_state = _start_advance(
+                    refreshed,
+                    revise=True,
+                    whole_rework=whole,
+                    _prechecked=True,
+                    revise_round=round_no,
+                    strategy=mode,
+                    affected_ids=ids,
+                    revise_log=log_rel,
+                    revise_context=revise_context,
+                )
+            except ActionError as exc:
+                _append_revise_log(
+                    log_path, [f"- 失败：自动推进未能启动：{exc.message}"]
+                )
+                raise ActionError(
+                    exc.status,
+                    "自动推进未能启动",
+                    f"旧审查已归档为 {archived['review']}，子任务重置："
+                    f"{'、'.join(changed) or '（无）'}；但自动推进未能启动：{exc.message}",
+                    "处理阻塞原因后重试；轮次已记为 "
+                    f"{round_no}/{MAX_REVISE_ROUNDS}。",
+                ) from exc
+            except Exception as exc:
+                _append_revise_log(
+                    log_path, [f"- 失败：自动推进未能启动：{exc}"]
+                )
+                raise ActionError(
+                    500,
+                    "自动推进未能启动",
+                    f"旧审查已归档为 {archived['review']}，子任务重置："
+                    f"{'、'.join(changed) or '（无）'}；但自动推进未能启动：{exc}",
+                    "查看控制台错误后重试；轮次已记为 "
+                    f"{round_no}/{MAX_REVISE_ROUNDS}。",
+                ) from exc
+            _append_revise_log(
+                log_path,
+                [
+                    f"- 自动推进：已启动（{ADVANCE_STATE_NAMES.get('running', '推进中')}）",
+                    f"- 推进状态：{_display_path(_advance_state_path(task.task_id))}",
+                    "- 分发与审核复用执行器单实例锁，串行执行。",
+                ],
             )
-        except ConfigError as exc:
-            _append_revise_log(log_path, [f"- 失败：重置 subtasks.yaml 失败：{exc}"])
-            raise ActionError(
-                500,
-                "子任务无法重置",
-                f"{exc}；旧审查已复制到 {archived['review']}，原件未删除。",
-                "检查 对接/subtasks.yaml 后重试。",
-            ) from exc
-        changed_ids = set(changed)
-        _append_revise_log(
-            log_path,
-            [
-                f"- 重置为 pending：{'、'.join(changed) or '（无）'}",
-                f"- 未改动的子任务："
-                + (
-                    "、".join(
-                        item.id
-                        for item in task.subtasks
-                        if item.id not in changed_ids
-                    )
-                    or "（无）"
+            return {
+                "ok": True,
+                "task": task.task_id,
+                "revise_round": round_no,
+                "max_rounds": MAX_REVISE_ROUNDS,
+                "mode": mode,
+                "mode_label": REVISE_MODE_LABELS.get(mode, mode),
+                "whole_rework": whole,
+                "owner_role": task.owner_role if whole else "",
+                "rework_done": _display_path(done_path) if whole else "",
+                "target_ids": target_ids if mode == REVISE_MODE_AFFECTED else (
+                    list(plan["all_ids"]) if mode == REVISE_MODE_ALL else []
                 ),
-            ],
-        )
-
-        try:
-            _write_revise_round(task, round_no)
-        except ConfigError as exc:
-            _append_revise_log(log_path, [f"- 失败：写入 revise_round 失败：{exc}"])
-            raise ActionError(
-                500,
-                "修正轮次无法写入",
-                f"{exc}；旧审查已归档，子任务重置：{'、'.join(changed) or '（无）'}。",
-                "检查 对接/task.yaml 后重试。",
-            ) from exc
-
-        refreshed = _find_task(task.task_id)
-        if refreshed is None:
-            _append_revise_log(log_path, ["- 失败：重置后找不到任务。"])
-            raise ActionError(
-                500,
-                "找不到任务",
-                f"{task.task_id} 在重置后不在活动项目目录中。",
-                "检查项目目录是否被移动或归档。",
-            )
-        try:
-            advance_state = _start_advance(
-                refreshed,
-                revise=True,
-                _prechecked=True,
-                revise_round=round_no,
-                strategy=mode,
-                affected_ids=ids,
-                revise_log=log_rel,
-            )
-        except ActionError as exc:
-            _append_revise_log(
-                log_path, [f"- 失败：自动推进未能启动：{exc.message}"]
-            )
-            raise ActionError(
-                exc.status,
-                "自动推进未能启动",
-                f"旧审查已归档为 {archived['review']}，子任务重置："
-                f"{'、'.join(changed) or '（无）'}；但自动推进未能启动：{exc.message}",
-                "处理阻塞原因后重试；轮次已记为 "
-                f"{round_no}/{MAX_REVISE_ROUNDS}。",
-            ) from exc
-        except Exception as exc:
-            _append_revise_log(
-                log_path, [f"- 失败：自动推进未能启动：{exc}"]
-            )
-            raise ActionError(
-                500,
-                "自动推进未能启动",
-                f"旧审查已归档为 {archived['review']}，子任务重置："
-                f"{'、'.join(changed) or '（无）'}；但自动推进未能启动：{exc}",
-                "查看控制台错误后重试；轮次已记为 "
-                f"{round_no}/{MAX_REVISE_ROUNDS}。",
-            ) from exc
-        _append_revise_log(
-            log_path,
-            [
-                f"- 自动推进：已启动（{ADVANCE_STATE_NAMES.get('running', '推进中')}）",
-                f"- 推进状态：{_display_path(_advance_state_path(task.task_id))}",
-                "- 分发与审核复用执行器单实例锁，串行执行。",
-            ],
-        )
-        return {
-            "ok": True,
-            "task": task.task_id,
-            "revise_round": round_no,
-            "max_rounds": MAX_REVISE_ROUNDS,
-            "mode": mode,
-            "mode_label": REVISE_MODE_LABELS.get(mode, mode),
-            "target_ids": target_ids if mode == REVISE_MODE_AFFECTED else (
-                list(plan["all_ids"]) if mode == REVISE_MODE_ALL else []
-            ),
-            "reset_subtasks": changed,
-            "archived_review": archived["review"],
-            "archived_review_done": archived.get("review_done") or "",
-            "history_directory": archived["directory"],
-            "log": log_rel,
-            "log_url": f"/log?path={quote(log_rel, safe='')}",
-            "advance": advance_state,
-            "status_url": f"/api/task/{task.task_id}/revise-status",
-        }
+                "reset_subtasks": changed,
+                "archived_outputs": archived_outputs,
+                "archived_review": archived["review"],
+                "archived_review_done": archived.get("review_done") or "",
+                "history_directory": archived["directory"],
+                "log": log_rel,
+                "log_url": f"/log?path={quote(log_rel, safe='')}",
+                "advance": advance_state,
+                "status_url": f"/api/task/{task.task_id}/revise-status",
+            }
 
 
 def _run_log_tail(record: Dict[str, object]) -> List[str]:
@@ -6519,7 +8988,29 @@ def _parse_simple_yaml(text: str) -> Dict[str, object]:
     return data
 
 
-def _parse_subtasks_text(text: str) -> Tuple[Subtask, ...]:
+def _subtask_id_problem(
+    subtask_id: str, expected_task_id: str = ""
+) -> str:
+    """子任务 ID 边界：只允许 <任务编号>-<数字>，不允许路径片段。"""
+    value = str(subtask_id or "")
+    if not value:
+        return "缺少 id"
+    if any(ord(char) < 32 for char in value):
+        return "包含控制字符"
+    if "/" in value or "\\" in value or ".." in value:
+        return "包含路径分隔符或 .."
+    if not SUBTASK_ID_RE.fullmatch(value):
+        return "必须形如 <任务编号>-<序号>（如 T23-1）"
+    if expected_task_id:
+        prefix = str(expected_task_id).strip().upper()
+        if not re.fullmatch(re.escape(prefix) + r"-\d+", value, re.IGNORECASE):
+            return f"前缀必须是任务编号 {prefix}"
+    return ""
+
+
+def _parse_subtasks_text(
+    text: str, expected_task_id: str = ""
+) -> Tuple[Subtask, ...]:
     """解析 对接/subtasks.yaml 的固定结构。
 
     只接受 `subtasks:` 下的映射列表；支持引号、注释、手写缩进和 |/> 块文本。
@@ -6648,11 +9139,15 @@ def _parse_subtasks_text(text: str) -> Tuple[Subtask, ...]:
     for number, record in enumerate(records, start=1):
         task_id = str(record.get("id") or "").strip()
         title = str(record.get("title") or "").strip()
-        if not task_id:
-            raise ConfigError(f"第 {number} 个子任务缺少 id。")
-        if task_id in seen_ids:
+        problem = _subtask_id_problem(task_id, expected_task_id)
+        if problem:
+            raise ConfigError(
+                f"第 {number} 个子任务 id 不合法：{task_id or '（空）'}（{problem}）。"
+            )
+        key = task_id.casefold()
+        if key in seen_ids:
             raise ConfigError(f"子任务 id 重复：{task_id}")
-        seen_ids.add(task_id)
+        seen_ids.add(key)
         if not title:
             raise ConfigError(f"子任务 {task_id} 缺少 title。")
         status = str(record.get("status") or "pending").strip().lower()
@@ -6669,15 +9164,19 @@ def _parse_subtasks_text(text: str) -> Tuple[Subtask, ...]:
                 status=status,
                 agent_role=str(record.get("agent_role") or "").strip(),
                 log=str(record.get("log") or "").strip(),
+                run_id=str(record.get("run_id") or "").strip(),
                 error=str(record.get("error") or "").strip(),
                 started_at=str(record.get("started_at") or "").strip(),
                 finished_at=str(record.get("finished_at") or "").strip(),
+                attempt=_meta_int(record.get("attempt")),
             )
         )
     return tuple(subtasks)
 
 
-def _load_subtasks(path: Path) -> Tuple[Tuple[Subtask, ...], str]:
+def _load_subtasks(
+    path: Path, expected_task_id: str = ""
+) -> Tuple[Tuple[Subtask, ...], str]:
     if not path.is_file():
         return (), ""
     try:
@@ -6687,8 +9186,15 @@ def _load_subtasks(path: Path) -> Tuple[Tuple[Subtask, ...], str]:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         return (), f"读取 {SUBTASKS_NAME} 失败：{exc}"
+    if not expected_task_id:
+        try:
+            match = PROJECT_NAME_RE.fullmatch(Path(path).parent.parent.name)
+        except (OSError, ValueError):
+            match = None
+        if match:
+            expected_task_id = match.group(1)
     try:
-        return _parse_subtasks_text(text), ""
+        return _parse_subtasks_text(text, expected_task_id), ""
     except ConfigError as exc:
         return (), str(exc)
 
@@ -8132,6 +10638,24 @@ def _render_advance_panel(task: Task, phase: str) -> str:
     started_at = str(payload.get("started_at") or "")
     finished_at = str(payload.get("finished_at") or "")
     auto = bool(payload.get("auto"))
+    budget = payload.get("budget")
+    if not isinstance(budget, dict):
+        budget = {}
+    budget_limits = budget.get("limits")
+    if not isinstance(budget_limits, dict):
+        budget_limits = {}
+    budget_used = budget.get("used")
+    if not isinstance(budget_used, dict):
+        budget_used = {}
+    hours = float(budget_limits.get("max_runtime_seconds") or 0) / 3600.0
+    budget_line = (
+        "预算：最长 "
+        f"{hours:g} 小时 · 子任务 ≤{int(float(budget_limits.get('max_subtasks') or 0))} 个"
+        f" · 修订 ≤{int(float(budget_limits.get('max_revise_rounds') or 0))} 轮"
+        f"；已用 {float(budget_used.get('runtime_seconds') or 0):.0f} 秒"
+        f"、{int(float(budget_used.get('subtasks') or 0))} 个子任务"
+        f"、第 {int(float(budget_used.get('revise_round') or 0))} 轮"
+    )
     events = payload.get("events")
     if not isinstance(events, list):
         events = []
@@ -8163,24 +10687,34 @@ def _render_advance_panel(task: Task, phase: str) -> str:
             <span id="advance-live-label">全自动推进中 · {_esc(step_label or "准备")}</span></p>
           <p class="dispatch-live-note" id="advance-live-message">{_esc(message or "正在推进…")}</p>
           {events_html}
-          <p class="advance-time">开始 {_esc(started_at or "—")}</p>
+          <p class="advance-time">开始 {_esc(started_at or "—")} · {_esc(budget_line)}</p>
         </div>
         """
-        action_html = (
-            '<p class="dispatch-hint">全自动推进正在进行；分发与审核都复用执行器单实例锁。'
-            "页面会自动轮询，结束后刷新。</p>"
-        )
+        action_html = f"""
+        <div class="dispatch-action-row">
+          <form class="dispatch-action" method="post"
+            action="/advance/{_esc(task.task_id)}/stop"
+            data-confirm="确认停止全自动推进 {_esc(task.task_id)}？系统会终止当前 Agent 并释放执行器锁；停止后不会自动重新拉起。">
+            <button class="button button--ghost" id="advance-stop" type="submit">
+              停止推进<span class="button-mark" aria-hidden="true">■</span>
+            </button>
+          </form>
+          <p class="dispatch-hint">停止由你显式触发；当前 Agent 会被终止，
+            执行器锁会释放，之后不会自动重新拉起。页面会自动轮询，结束后刷新。</p>
+        </div>
+        """
     else:
         tone = "notice--ok" if state_name == "completed" else (
-            "notice--warn" if state_name == "stopped" else (
-                "notice--error" if state_name == "failed" else ""
-            )
+            "notice--warn"
+            if state_name in {"stopped", "stopped_with_budget"}
+            else ("notice--error" if state_name == "failed" else "")
         )
         summary = ""
-        if state_name in {"completed", "stopped", "failed"}:
+        if state_name in {"completed", "stopped", "stopped_with_budget", "failed"}:
             heading = {
                 "completed": "全自动推进完成",
                 "stopped": "全自动推进已停止",
+                "stopped_with_budget": "全自动推进已停止（预算用尽）",
                 "failed": "全自动推进失败",
             }.get(state_name, "全自动推进")
             summary = f"""
@@ -8192,7 +10726,7 @@ def _render_advance_panel(task: Task, phase: str) -> str:
         disabled_attr = "" if can_start else " disabled"
         button_label = (
             "重新全自动推进"
-            if state_name in {"failed", "stopped"}
+            if state_name in {"failed", "stopped", "stopped_with_budget"}
             else "全自动推进"
         )
         confirm = (
@@ -8203,6 +10737,7 @@ def _render_advance_panel(task: Task, phase: str) -> str:
         live_html = f"""
         {summary}
         {events_html}
+        <p class="advance-time">{_esc(budget_line)}</p>
         <div class="advance-copy">
           <p><strong>一条链跑到底：</strong>分发剩余 → 自动审核 → 停在「已通过 / 须修正」。</p>
           <p>不会重跑 delivered/passed 子任务；失败项会重置为 pending 后重试一次。
@@ -8278,6 +10813,8 @@ def _render_revise_panel(task: Task, phase: str) -> str:
     if not isinstance(all_ids, list):
         all_ids = []
     has_subtasks = bool(payload.get("has_subtasks"))
+    whole_rework = bool(payload.get("whole_rework"))
+    owner_role = str(payload.get("owner_role") or DEFAULT_OWNER_ROLE)
     at_limit = bool(payload.get("at_limit"))
     round_no = int(payload.get("revise_round") or 0)
     next_round = int(payload.get("next_round") or 1)
@@ -8336,21 +10873,29 @@ def _render_revise_panel(task: Task, phase: str) -> str:
         choice_hint = (
             "请选择「全部子任务重做」或「只重新审核（不改产物）。"
             if has_subtasks
-            else "本任务没有子任务，只能选择「只重新审核（不改产物）」。"
+            else (
+                f"本任务没有子任务，将回叫 owner_role={owner_role} 绑定的 Agent "
+                "整单重修；旧审查会移入 对接/审查历史/。"
+            )
         )
         target_html = f"""
         <div class="notice notice--warn revise-choice-note" role="status">
           <strong>未识别到具体子任务。</strong>
           <span>问题清单里没有出现可识别的子任务编号（Txx-n）。
-            {choice_hint}</span>
+            {_esc(choice_hint)}</span>
         </div>
         """
 
     if running:
         title = f"修正中…（第 {round_no} 轮）"
         description = (
-            "正在按修正计划重新分发受影响子任务，全部交付后自动重新审核；"
+            "正在回叫 owner_role 重做整单，写完新 DONE.md 后自动重新审核；"
             "本页会自动刷新最新结论。"
+            if whole_rework
+            else (
+                "正在按修正计划重新分发受影响子任务，全部交付后自动重新审核；"
+                "本页会自动刷新最新结论。"
+            )
         )
         live_html = f"""
         <div class="dispatch-live" id="revise-live" role="status" aria-live="polite">
@@ -8385,8 +10930,14 @@ def _render_revise_panel(task: Task, phase: str) -> str:
             else "已达修正轮次上限"
         )
         description = (
-            "审核结论为「须修正」。系统会只重置问题清单涉及的子任务，"
-            "然后自动分发并重新审核；未受影响的子任务不会重跑。"
+            f"审核结论为「须修正」。本任务没有子任务：将把旧审查移入审查历史，"
+            f"回叫 owner_role={owner_role} 绑定的 Agent 整单重修，"
+            "完成后自动重新审核。"
+            if whole_rework
+            else (
+                "审核结论为「须修正」。系统会只重置问题清单涉及的子任务，"
+                "然后自动分发并重新审核；未受影响的子任务不会重跑。"
+            )
         )
         last_result_html = ""
         if state_name == "failed":
@@ -8470,21 +11021,40 @@ def _render_revise_panel(task: Task, phase: str) -> str:
                 f"复制旧审查到 对接/{REVIEW_HISTORY_DIRNAME}/{round_archive}，"
                 "然后自动分发并重新审核。同一时刻只允许一个 Agent 运行。"
             )
+            confirm_whole = (
+                f"确认整单重修 {task.task_id}（第 {next_round} 轮）？"
+                "该任务没有子任务：将把旧审查移入 "
+                f"对接/{REVIEW_HISTORY_DIRNAME}/{round_archive}，"
+                f"回叫 owner_role={owner_role} 绑定的 Agent 重做整单，"
+                "写新 DONE.md 后自动重新审核。同一时刻只允许一个 Agent 运行。"
+            )
             confirm_review = (
                 f"确认只重新审核 {task.task_id}（第 {next_round} 轮）？"
                 "不会修改任何子任务产物；只复制旧审查并重新启动审核。"
             )
             all_disabled = disabled_attr if has_subtasks else " disabled"
-            action_html = f"""
-            <div class="revise-choice-row">
-              {f'''<form class="dispatch-action" method="post"
+            primary_form = (
+                f'''<form class="dispatch-action" method="post"
+                action="/revise/{_esc(task.task_id)}"
+                data-confirm="{_esc(confirm_whole)}">
+                <input type="hidden" name="mode" value="{REVISE_MODE_WHOLE}">
+                <button class="button button--signal" id="revise-start" type="submit"{disabled_attr}>
+                  {_esc(f'整单重修（第 {next_round} 轮）' if not at_limit else '已达修正上限')}<span class="button-mark" aria-hidden="true">→</span>
+                </button>
+              </form>'''
+                if whole_rework
+                else f'''<form class="dispatch-action" method="post"
                 action="/revise/{_esc(task.task_id)}"
                 data-confirm="{_esc(confirm_all)}">
                 <input type="hidden" name="mode" value="{REVISE_MODE_ALL}">
                 <button class="button button--signal" id="revise-start" type="submit"{all_disabled}>
                   全部子任务重做<span class="button-mark" aria-hidden="true">→</span>
                 </button>
-              </form>''' if has_subtasks else ''}
+              </form>'''
+            )
+            action_html = f"""
+            <div class="revise-choice-row">
+              {primary_form}
               <form class="dispatch-action" method="post"
                 action="/revise/{_esc(task.task_id)}"
                 data-confirm="{_esc(confirm_review)}">
@@ -8530,9 +11100,10 @@ def _render_revise_panel(task: Task, phase: str) -> str:
         </div>
         {live_html}
         <p class="dispatch-panel-foot">
-          继续修正复用执行器<strong>单实例锁</strong>；旧审查只复制到
-          <code>对接/{_esc(REVIEW_HISTORY_DIRNAME)}/</code>，不删除原件。
-          重置只作用于问题清单涉及（或你选择全部）的子任务；未受影响的已交付子任务不重跑。
+          继续修正复用执行器<strong>单实例锁</strong>；
+          {'整单重修会把旧审查移入' if whole_rework else '旧审查只复制到'}
+          <code>对接/{_esc(REVIEW_HISTORY_DIRNAME)}/</code>，不删除文件。
+          {'owner_role 绑定的 Agent 重做整单后必须写新 DONE.md，再看 G2/G3。' if whole_rework else '重置只作用于问题清单涉及（或你选择全部）的子任务；未受影响的已交付子任务不重跑。'}
           控制台不写 <code>对接/{REVIEW_NAME}</code>，新结论仍只由审核角色写入。
         </p>
       </section>
@@ -8542,7 +11113,8 @@ def _render_revise_panel(task: Task, phase: str) -> str:
 def _handoff_probe_stage(task: Task, phase: str) -> Tuple[str, int]:
     if phase in {PHASE_REVIEW_READY, PHASE_REVIEWING}:
         return "review", 0
-    if task.review_path is not None:
+    terminal, _verdict = _review_terminal_state(task)
+    if terminal:
         return "review_complete", task.revise_round
     return "dispatch", 0
 
@@ -9520,6 +12092,15 @@ def _render_task_detail(
                 <code>项目/&lt;编号&gt;/工作区/</code>。</p>
               <button class="button button--ghost button--small" type="submit">保存工作目录</button>
             </form>
+            <form class="workdir-form" method="post" action="/task/{_esc(task.task_id)}/owner-role">
+              <label class="aside-kicker" for="owner-role-input">owner_role（整单重修）</label>
+              <input class="field-input" id="owner-role-input" name="owner_role" type="text"
+                maxlength="48" value="{_esc(task.owner_role)}"
+                autocomplete="off" spellcheck="false">
+              <p class="workdir-hint">无子任务任务在「须修正」时回叫该角色绑定的 Agent；
+                默认 <code>designer</code>，必须是已存在角色。</p>
+              <button class="button button--ghost button--small" type="submit">保存 owner_role</button>
+            </form>
         """
     )
 
@@ -10184,6 +12765,8 @@ def _render_run_card(
         round_html = "审核"
     elif kind == "handoff":
         round_html = "交接补交"
+    elif kind == "whole_rework":
+        round_html = "整单重修"
     else:
         round_html = f"r{_esc(round_no)}" if round_no not in (None, "") else "—"
     run_id = str(record.get("run_id") or "")
@@ -11014,9 +13597,8 @@ def _task_revise_api(task: Task) -> Dict[str, object]:
     reason = "当前阶段不是「须修正」，无需继续修正。"
     if phase == PHASE_REVISE:
         can_start, reason = _revise_availability(task)
-    target_ids = (
-        _review_target_ids(task) if task.review_path is not None else []
-    )
+    terminal, _verdict = _review_terminal_state(task)
+    target_ids = _review_target_ids(task) if terminal else []
     return {
         "revise_round": task.revise_round,
         "revise_max_rounds": MAX_REVISE_ROUNDS,
@@ -11026,9 +13608,12 @@ def _task_revise_api(task: Task) -> Dict[str, object]:
         "revise_targets": target_ids,
         "revise_needs_choice": bool(
             phase == PHASE_REVISE
-            and task.review_path is not None
+            and terminal
+            and task.subtasks
             and not target_ids
         ),
+        "revise_whole_rework": bool(task and not task.subtasks),
+        "revise_owner_role": task.owner_role,
         "revise_at_limit": task.revise_round >= MAX_REVISE_ROUNDS,
     }
 
@@ -11059,12 +13644,13 @@ def _tasks_api_payload(tasks: List[Task]) -> dict:
                 "handoff_retry_url": f"/handoff/retry/{task.task_id}",
                 "has_review": task.review_path is not None,
                 "has_review_done": (task.docking_dir / REVIEW_DONE_NAME).is_file(),
-                "review_verdict": _review_verdict(task.review_text),
+                "review_verdict": _review_terminal_verdict(task),
                 "project": task.project_name,
                 "project_path": _display_path(task.project_dir),
                 "desk_root": str(PROJECT_DIR),
                 "workdir": str(task.workdir),
                 "workdir_is_custom": task.uses_custom_workdir,
+                "owner_role": task.owner_role,
                 "meta_path": _display_path(task.meta_path),
                 "task_file": task.path.name,
                 "task_path": _display_path(task.path),
@@ -11630,6 +14216,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._handle_workdir_post(raw_id.upper())
             return
 
+        owner_role_match = re.fullmatch(
+            r"/task/([^/]+)/owner-role", normalized
+        )
+        if owner_role_match:
+            raw_id = owner_role_match.group(1)
+            if not TASK_ID_RE.fullmatch(raw_id):
+                self._workdir_error_response(
+                    404,
+                    "任务编号格式不正确",
+                    "修改 owner_role 只接受形如 T07 的任务编号。",
+                    "返回任务详情页重新提交。",
+                )
+                return
+            self._handle_owner_role_post(raw_id.upper())
+            return
+
         handoff_retry_match = re.fullmatch(
             r"/handoff/retry/([^/]+)", normalized
         )
@@ -11679,6 +14281,22 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._handle_review_post(review_match.group(1).upper())
+            return
+
+        advance_stop_match = re.fullmatch(r"/advance/([^/]+)/stop", normalized)
+        if advance_stop_match:
+            if not TASK_ID_RE.fullmatch(advance_stop_match.group(1)):
+                self._send(
+                    404,
+                    _render_error(
+                        404,
+                        "任务编号格式不正确",
+                        "停止推进只接受形如 T06 的任务编号。",
+                        "返回任务详情页重新操作。",
+                    ),
+                )
+                return
+            self._handle_advance_stop_post(advance_stop_match.group(1).upper())
             return
 
         advance_match = re.fullmatch(r"/advance/([^/]+)", normalized)
@@ -11917,6 +14535,47 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         self._redirect(f"/task/{task_id}?workdir=1")
 
+    def _handle_owner_role_post(self, task_id: str) -> None:
+        task = _find_task(task_id)
+        try:
+            if task is None:
+                raise ActionError(
+                    404,
+                    "没有找到这张任务单",
+                    f"{task_id} 不在 项目/ 或 归档/ 的任务单中。",
+                    "检查编号，或返回看板重新选择。",
+                )
+            fields = self._read_urlencoded_form()
+            owner_role = _update_task_owner_role(
+                task, fields.get("owner_role", "")
+            )
+        except ActionError as exc:
+            self._workdir_error_response(
+                exc.status, exc.title, exc.message, exc.hint
+            )
+            return
+        except FormError as exc:
+            self._workdir_error_response(
+                400,
+                "owner_role 没有更新",
+                str(exc),
+                "填写 协作/roles/ 中已存在的角色 id；默认 designer。",
+            )
+            return
+
+        if self._wants_json():
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "task": task_id,
+                    "owner_role": owner_role,
+                    "meta": _display_path(task.meta_path),
+                },
+            )
+            return
+        self._redirect(f"/task/{task_id}")
+
     def _workdir_error_response(
         self, status: int, title: str, message: str, hint: str = ""
     ) -> None:
@@ -12106,6 +14765,45 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             )
             return
         self._redirect(f"/task/{task_id}?advance=1")
+
+    def _handle_advance_stop_post(self, task_id: str) -> None:
+        try:
+            task = _find_task(task_id)
+            if task is None:
+                raise ActionError(
+                    404,
+                    "没有找到可停止的任务",
+                    f"{task_id} 不在 项目/*/对接/任务单.md 中。",
+                    "返回任务看板确认编号与项目状态。",
+                )
+            final = _stop_advance(task.task_id)
+        except ActionError as exc:
+            self._dispatch_error_response(exc)
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            self._dispatch_error_response(
+                ActionError(
+                    500,
+                    "停止推进时出错",
+                    f"服务遇到未预期的错误：{exc}",
+                    "刷新详情页查看状态；如仍有锁，请检查 /runs。",
+                )
+            )
+            return
+
+        if self._wants_json():
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "message": "已停止全自动推进；当前 Agent 已终止，执行器锁已检查。",
+                    "advance": final,
+                    "status_url": f"/api/task/{task_id}/advance-status",
+                },
+            )
+            return
+        self._redirect(f"/task/{task_id}")
 
     def _handle_revise_post(self, task_id: str) -> None:
         mode = ""
@@ -12587,6 +15285,8 @@ class ConsoleServer(ThreadingHTTPServer):
 
 def main() -> None:
     global PORT, RUNNER, RUNNER_TIMEOUT_SECONDS, REGISTRATION_TIMEOUT_SECONDS
+    global ADVANCE_MAX_RUNTIME_SECONDS, ADVANCE_MAX_SUBTASKS
+    global ADVANCE_MAX_REVISE_ROUNDS
     parser = argparse.ArgumentParser(description="协作值班台本地控制台")
     parser.add_argument(
         "--port",
@@ -12608,6 +15308,30 @@ def main() -> None:
         metavar="SECONDS",
         help=f"总控登记调用超时，默认 {DEFAULT_REGISTRATION_TIMEOUT_SECONDS} 秒",
     )
+    parser.add_argument(
+        "--advance-max-runtime",
+        type=int,
+        default=int(ADVANCE_MAX_RUNTIME_SECONDS),
+        metavar="SECONDS",
+        help=(
+            "全自动推进最长运行时长，默认 "
+            f"{int(ADVANCE_MAX_RUNTIME_SECONDS)} 秒（2 小时）"
+        ),
+    )
+    parser.add_argument(
+        "--advance-max-subtasks",
+        type=int,
+        default=ADVANCE_MAX_SUBTASKS,
+        metavar="N",
+        help=f"全自动推进最多启动的子任务数，默认 {ADVANCE_MAX_SUBTASKS}",
+    )
+    parser.add_argument(
+        "--advance-max-revise-rounds",
+        type=int,
+        default=ADVANCE_MAX_REVISE_ROUNDS,
+        metavar="N",
+        help=f"全自动推进最多修订轮次，默认 {ADVANCE_MAX_REVISE_ROUNDS}",
+    )
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("--port 必须在 1024–65535 之间")
@@ -12619,9 +15343,18 @@ def main() -> None:
         parser.error(
             f"--register-timeout 必须在 1–{MAX_REGISTRATION_TIMEOUT_SECONDS} 秒之间"
         )
+    if not 1 <= args.advance_max_runtime:
+        parser.error("--advance-max-runtime 必须是正整数秒")
+    if not 1 <= args.advance_max_subtasks:
+        parser.error("--advance-max-subtasks 必须是正整数")
+    if not 1 <= args.advance_max_revise_rounds:
+        parser.error("--advance-max-revise-rounds 必须是正整数")
     PORT = args.port
     RUNNER_TIMEOUT_SECONDS = float(args.run_timeout)
     REGISTRATION_TIMEOUT_SECONDS = float(args.register_timeout)
+    ADVANCE_MAX_RUNTIME_SECONDS = float(args.advance_max_runtime)
+    ADVANCE_MAX_SUBTASKS = int(args.advance_max_subtasks)
+    ADVANCE_MAX_REVISE_ROUNDS = int(args.advance_max_revise_rounds)
     RUNNER = runner_engine.Runner(PROJECT_DIR, timeout_seconds=RUNNER_TIMEOUT_SECONDS)
     reconciled = RUNNER.reconcile()
     if reconciled is not None:
@@ -12632,6 +15365,12 @@ def main() -> None:
     if stale_registrations:
         print(
             f"[登记] 已把 {stale_registrations} 个上次未收尾的登记标记为 failed；可重试。"
+        )
+    interrupted_subtasks = _reconcile_interrupted_subtasks()
+    if interrupted_subtasks:
+        print(
+            f"[分发] 已把 {interrupted_subtasks} 个上次未收尾的子任务标记为 "
+            "failed（interrupted）；可继续分发重试。"
         )
 
     created = _ensure_default_roles()

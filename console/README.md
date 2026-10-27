@@ -28,6 +28,10 @@ python3 console/server.py --port 8789 --run-timeout 3600 --register-timeout 900
 - 默认监听 `127.0.0.1:8787`；`--port` 只改变端口，仍只绑定 `127.0.0.1`，不接受局域网或公网访问。
 - `--run-timeout` 是执行器单次运行的超时秒数，默认 `3600`，范围 1–604800。
 - `--register-timeout` 是发布后总控登记调用的超时秒数，默认 `900`，范围 1–86400。
+- `--advance-max-runtime` / `--advance-max-subtasks` / `--advance-max-revise-rounds`
+  是全自动推进预算，默认 `7200` 秒（2 小时）/ `12` 个子任务 / `3` 轮修订；也可用
+  `COLLAB_ADVANCE_MAX_RUNTIME_SECONDS` 等环境变量配置。超限停止为
+  `stopped_with_budget` 并释放 `runner.lock`。
 - 页面每次刷新都直接读取磁盘，不使用缓存。
 - 如目标端口已被占用，服务会直接报错退出。
 - 执行器收到 SIGTERM/`Ctrl+C` 时先终止当前 Agent 进程组并尽量释放锁；不触碰并非本实例启动的进程。总控登记进程同样会被收尾。
@@ -40,7 +44,7 @@ python3 console/server.py --port 8789 --run-timeout 3600 --register-timeout 900
 项目/<编号>_<短名>/
 ├── 对接/
 │   ├── idea.md                 # 发布时的人类原文（不改写）
-│   ├── task.yaml               # id · title · workdir · created_at · status（登记时）· revise_round
+│   ├── task.yaml               # id/title/workdir/created_at + status/controller/revise_round 等；未知扩展字段原样保留
 │   ├── 任务单.md               # 总控登记时写入；看板只认它
 │   ├── subtasks.yaml           # 总控拆出的 2–6 个子任务
 │   ├── 登记完成.md             # 总控最后写下的完成信号
@@ -49,7 +53,9 @@ python3 console/server.py --port 8789 --run-timeout 3600 --register-timeout 900
 │   ├── 审查.md                  # 审核角色：结论（通过 / 须修正）+ 证据 + 问题清单
 │   ├── 审核完成.md              # 审核完成信号
 │   └── 审查历史/
-│       └── round-1.md           # 继续修正时复制的上一轮审查快照（原件不删除）
+│       ├── round-1.md           # 继续修正时复制的上一轮审查快照（原件不删除）
+│       ├── invalid-<时间>.md    # 空/半份/不可识别审查在重试前移入这里（不删除）
+│       └── invalid-attribution-<时间>.md # 冒名/AI-A/缺署名的审查隔离（不删除）
 └── 工作区/                     # 默认 workdir；外部 workdir 时只保留日志
     └── 日志/
         ├── dispatch-<子任务>-<时间戳>.log # 每个子任务的 Agent stdout+stderr
@@ -60,7 +66,7 @@ python3 console/server.py --port 8789 --run-timeout 3600 --register-timeout 900
         └── register-<时间戳>.log # 总控登记调用的输出与固定提示词
 ```
 
-`对接/task.yaml` 缺失时自动生成，默认 `workdir = <项目目录>/工作区`。`workdir` 可以是系统外的绝对路径；执行器以它为 cwd 启动 Agent，但日志仍写值班台侧的 `工作区/日志/`。归档/恢复会整体移动项目目录，并把指向旧 `工作区/` 的默认 workdir 一并更新；指向系统外的 workdir 保持不变。
+`对接/task.yaml` 缺失时自动生成，默认 `workdir = <项目目录>/工作区`。`workdir` 可以是系统外的绝对路径；执行器以它为 cwd 启动 Agent，但日志仍写值班台侧的 `工作区/日志/`。归档/恢复会整体移动项目目录，**只**把指向旧 `工作区/` 的默认 workdir 跟着更新；status/controller/revise_round/auto_advance/idea_sha256/register_log 及未知扩展字段逐字段保留，指向系统外的 workdir 保持不变。
 
 T08 发布的任务在总控写出 `任务单.md` 前不会进入看板；期间可在 `/registering/<编号>` 查看登记进度。登记成功后，详情页与看板显示 `subtasks.yaml` 的子任务清单和「子任务 x/y」；子任务按角色串行分发，全部交付后可进入审核。中断后的再次分发只处理 pending/failed；完全没有子任务、但有任务级 `DONE.md` 或工作区产物的任务也能审核。审核为「须修正」的任务可在详情页继续修正，轮次记录在 `对接/task.yaml` 的 `revise_round`。
 
@@ -96,8 +102,9 @@ T08 发布的任务在总控写出 `任务单.md` 前不会进入看板；期间
 | `GET /api/task/<编号>/dispatch-status` | 分发进度 JSON：`state` / `total` / `done` / `success` / `failed` / `current_subtask` / `results` / `subtasks` |
 | `POST /review/<编号>` | 已交付后启动审核：全部子任务 delivered/passed，或任务级 `DONE.md` / 无子任务时的工作区产物；不要求有子任务。`reviewer` 角色必须绑定可执行 Agent 且无活锁；HTML 成功 `303` 回详情，JSON 返回 `202`；预检失败 `409` + 原因，不启动任何进程 |
 | `GET /api/task/<编号>/review-status` | 审核状态 JSON：`phase` / `state` / `running` / `conclusion` / `issues` / `log_url` / `can_start` / `disabled_reason` / `delivery_evidence` 等 |
-| `POST /advance/<编号>` | 全自动推进：循环分发 pending/failed，全部交付后自动审核，到通过 / 须修正 / 失败 / 交接阻塞即停。每一步前执行交接闸门；HTML 成功 `303` 到详情，JSON 返回 `202`；已有推进、分发、审核或登记占用时返回 `409` |
-| `GET /api/task/<编号>/advance-status` | 全自动推进状态 JSON：`state` / `running` / `terminal` / `auto` / `revise` / `step` / `current_subtask` / `phase` / `handoff_*` / `message` / `error` / `events` / `can_start` 等 |
+| `POST /advance/<编号>` | 全自动推进：循环分发 pending/failed，全部交付后自动审核，到通过 / 须修正 / 失败 / 交接阻塞 / 预算用尽即停。每一步前执行交接闸门。预算默认 2 小时 / 12 个子任务 / 3 轮修订，超限写 `stopped_with_budget` 并释放锁。HTML 成功 `303` 到详情，JSON 返回 `202`；已有推进、分发、审核或登记占用时返回 `409` |
+| `POST /advance/<编号>/stop` | 用户显式停止推进：终止当前 Agent 进程组、等待监视线程收尾并释放 `runner.lock`；状态写 `stopped`；手动停止后不自动拉起。JSON 返回 `200` + `advance`（含 `lock_released`），无推进时 `409` |
+| `GET /api/task/<编号>/advance-status` | 全自动推进状态 JSON：`state` / `running` / `terminal` / `can_stop` / `stop_url` / `stopped_with_budget` / `budget`（limits/used/exceeded/reason）/ `auto` / `revise` / `step` / `current_subtask` / `phase` / `handoff_*` / `message` / `error` / `events` / `can_start` 等 |
 | `GET /api/task/<编号>/handoff-status` | 最近一次交接体检 JSON：`state`（`checking` / `supplementing` / `passed` / `blocked`）/ `checks` / `missing` / `attempts` / `agent_runs` / `log_url` / `can_retry` |
 | `POST /handoff/retry/<编号>` | 对 `handoff_blocked` 的任务重跑最近阶段的 G1–G4 体检；仍缺件返回 `409` 和最新缺件清单，通过则解除阻塞（暂停中的推进不会自动续跑，需重新点推进） |
 | `POST /revise/<编号>` | 「须修正」任务的继续修正：仅当 `phase=revise` 且 G3 通过时可用；`revise_round` 达到 3 轮返回 `409` + 请人工介入。解析 `对接/审查.md` 问题清单中的 `Txx-n`，只重置命中子任务；未命中且未指定 `mode` 时返回 `409` + `needs_choice`。表单 `mode` 可选 `affected`（默认）/ `all` / `review`。旧审查复制到 `对接/审查历史/round-<n>.md`，随后启动既有 advance 流程（新一轮审核后检查 G4）。HTML 成功 `303` 到详情，JSON 返回 `202` |
@@ -198,11 +205,10 @@ subtasks:
 
 1. 最近交接体检为 `blocked`，或全自动推进停在 `handoff_blocked` → `handoff_blocked`（交接阻塞）
 2. 继续修正推进中 → 按当前步骤显示 `dispatching`（分发中）/ `reviewing`（审核中）；结束后回到审查结论
-3. 已有 `对接/审查.md` → `passed`（已通过）/ `revise`（须修正）
-4. 审核进程正在运行 → `reviewing`（审核中）
-5. 已有交付（`对接/交付/**/DONE.md`、全部子任务 delivered/passed，或无子任务时的工作区产物）→ `review_ready`（待审核）
-6. 分发进程正在运行 → `dispatching`（分发中）
-7. 有 pending / failed 子任务或其它情况 → `undispatched`（未分发）
+3. **运行中判定优先**：审核进程在跑 → `reviewing`；分发进程在跑 → `dispatching`，即使磁盘上还留着上一轮终态文件
+4. 审核终态：`对接/审查.md` 有明确结论（通过 / 须修正）**且** `对接/审核完成.md` 存在 → `passed` / `revise`；空、半份（缺完成信号）或结论不可识别一律不进终态
+5. 已有交付（`对接/交付/**/DONE.md`、全部子任务 delivered/passed，或无子任务时 workdir 产物）→ `review_ready`（待审核），并保留重新审核入口
+6. 有 pending / failed 子任务或其它情况 → `undispatched`（未分发）
 
 ## 交接闸门（T18）
 
@@ -211,7 +217,7 @@ subtasks:
 | 闸门 | 检查内容 | 责任角色 |
 | --- | --- | --- |
 | G1 登记完成 | `对接/task.yaml`（`status=registered`）、`任务单.md`、`subtasks.yaml`（可解析且 ≥1 个子任务）、`登记完成.md` | `controller` |
-| G2 子任务交付 | 每个 delivered/passed 子任务的 `工作区/子任务/<id>/DONE.md`（含「做了什么 / 怎么验 / 结果」）＋该目录至少 1 个非 DONE 产物 | 该子任务的 `agent_role` |
+| G2 子任务交付 | 每个 delivered/passed 子任务的 `<workdir>/子任务/<id>/DONE.md`（缺省 workdir 即 `工作区/`；含「做了什么 / 怎么验 / 结果」）＋该目录至少 1 个非 DONE 产物 | 该子任务的 `agent_role` |
 | G3 审核完成 | `对接/审查.md` 有可识别结论（通过 / 须修正）＋ `对接/审核完成.md` | `reviewer` |
 | G4 修正完成 | `对接/审查历史/round-<n>.md` ＋ 新一轮 `审查.md` 有可识别结论 | `reviewer` |
 
@@ -226,10 +232,10 @@ subtasks:
 人工分发的唯一入口是任务详情页的「开始分发实现 / 继续分发」；发布后的总控登记是第二个受控入口，它只能由 `POST /publish` / 重试触发，不能从 UI 传入任意提示词。执行器自己做四件事：拼固定子任务提示词、抢全局锁、启动子进程、记录日志与状态。
 
 1. **角色解析与预检**：`POST /dispatch/<编号>` 先读取 `对接/subtasks.yaml` 的全部 pending/failed 子任务，逐个检查 `agent_role`：角色必须存在、已启用、`agent_id` 非空，绑定的 Agent 必须已登记、`installed=true` 且命令当前可执行。任一不满足就返回 `409` 和完整 `violations` 清单，**不启动任何进程**。任务详情页不再提供 Agent 下拉直选。
-2. **固定提示词**：每个子任务使用按角色与子任务内容生成的固定模板：「你是 <角色名>。执行子任务 <id>：<title> … 工作目录：<workdir> … 完成后写 `工作区/子任务/<id>/DONE.md` … ★ 不得写 `对接/审查.md`；不得改其它子任务；不删文件」。UI 不传任意提示词。
+2. **固定提示词**：每个子任务使用按角色与子任务内容生成的固定模板：「你是 <角色名>。执行子任务 <id>：<title> … 工作目录（cwd）：<workdir> … 输出目录（绝对路径）：`<workdir>/子任务/<id>` … 完成后写 DONE.md（绝对路径）… ★ 不得写 `对接/审查.md`；不得改其它子任务；不删文件」。提示词、G2、审核清单与执行器日志共用同一个绝对 output_dir；默认与外部 workdir 规则一致，不再要求多套一层 `工作区/`。UI 不传任意提示词。
 3. **串行执行与命令**：按 subtasks.yaml 顺序逐个启动，前一个收尾后才启动下一个。`agent.command` + `args_template` 经 `shlex` 拆分，唯一的 `{prompt}` token 替换为提示词；不经过 shell。普通运行与分发的 cwd 固定为该任务的 **workdir**（来自 `对接/task.yaml`，不是 `Agent.cwd`），`stdin=DEVNULL`，stdout/stderr 合并进日志。workdir 必须绝对、非系统根、非 `协作/`；系统根内只允许 `项目/<编号>_<短名>/工作区/`，系统外目录必须已存在或可创建。任务目录必须是编号匹配的 `项目/` 直接子目录，符号链接会被拒绝。审核运行的 cwd 是本任务的项目目录，且执行器只接受这一处 cwd 覆盖。
 4. **单实例锁**：`协作/调度台/runner.lock` 使用原子独占创建，写入执行器 PID、Agent PID、任务、Agent、开始时间和 token。已有活锁时 `POST /dispatch` 返回 409，绝不启动第二个写手。正常退出/失败/超时均释放；硬崩溃留下的失效锁在下次抢锁时按 PID 判死并清理。服务启动时的 `reconcile` 也先抢锁再判定遗留状态，不会改写活锁对应的运行。
-5. **原子状态回写**：启动子任务前把该条 `status` 改为 `running`；结束后改为 `delivered`（退出码 0）或 `failed`（非零/超时/启动失败），并写入 `log`、`started_at`、`finished_at`、`error`。每次只改原文中的目标字段，保留其它字段、注释与块文本，用同目录临时文件 `os.replace` 原子替换。失败默认停止后续子任务。继续分发时 failed 条目先原子重置为 pending（清空本轮时间/错误/日志引用，不删日志文件），delivered/passed 不重跑。
+5. **原子状态回写与崩溃恢复**：启动子任务前把该条 `status` 改为 `running`；拉起执行器后再落本轮 `log` 与 `run_id`。结束后改为 `delivered`（退出码 0）或 `failed`（非零/超时/启动失败），并写入 `log`、`started_at`、`finished_at`、`error`。每次只改原文中的目标字段，保留其它字段、注释与块文本，用同目录临时文件 `os.replace` 原子替换。失败默认停止后续子任务。继续分发时 failed 条目先原子重置为 pending（清空本轮时间/错误/日志引用，不删日志文件），delivered/passed 不重跑。控制台启动时额外执行子任务 reconcile：无活锁且内存中无对应分发/审核/推进线程的 `running` 子任务改为 `failed`（`error: interrupted`），保留原 `log`/`run_id`；有活锁的任务不动。恢复后「继续分发」会选中这些 failed 项。
 6. **超时**：默认 3600 秒，`--run-timeout` 可配。超时会向子进程组发 SIGTERM，宽限后 SIGKILL，状态记为 `timeout` 并回写为子任务 `failed`。
 7. **收尾**：即使主 CLI 正常退出，也会先排空其会话进程组，杀掉遗留的后台子进程，再写结束状态、释放锁。避免“日志结束但后台仍在写”的第二个写手。
 8. **输出**：每个子任务新建值班台侧 `项目/<编号>_<短名>/工作区/日志/dispatch-<子任务>-<时间戳>.log`，不覆盖既有日志；日志包含 kind=dispatch、subtask、workdir、提示词、Agent 输出和收尾信息。日志不会写进外部 workdir。详情页子任务表格的「日志」列链接到 `/log?path=...`。
@@ -238,11 +244,11 @@ subtasks:
 11. **结束状态**：`success`（退出码 0）、`failed`（非零退出、崩溃或启动失败）、`timeout`。锁释放后才可开始下一次运行。控制台正常退出会终止它自己启动的 Agent 进程组并尽量完成收尾。
 12. **分发进度**：分发状态以 JSON 持久化在 `协作/调度台/dispatch-<编号>.status.json`；页面轮询 `GET /api/task/<编号>/dispatch-status`。同一时刻只允许一个分发；分发期间归档该项目或修改其 workdir 会返回 409。状态另含 `failed_subtasks` / `delivered` / `retried` / `action_label` 供继续分发按钮与页面使用。
 13. **总控登记复用**：`launch_registration` 使用同一个 `runner.lock`、空 stdin、超时和进程组收尾，但用单独提示词与 `register-*.log`；不写 `runner.status` / `runner.history`。登记监控结束前会先写回 `task.yaml` 终态，再释放锁，避免登记结果与其他写手交错。
-14. **审核**：`POST /review/<编号>` 先预检所有已有子任务均为 `delivered`/`passed`，并且存在任务级交付（`对接/交付/**/DONE.md`，无子任务时也接受工作区产物）；没有 `subtasks.yaml` 也可审核。再解析 `reviewer` 角色绑定的 Agent；任一不满足返回 409，不启动进程。启动时 `kind=review`；因为审核要同时读 `对接/` 与 `工作区/`，进程 cwd 是本任务的项目目录（`runner.launch(cwd=项目目录)`，仍是该任务自己的目录，不是值班台根），日志为 `工作区/日志/review-<时间戳>.log`，`runner.status` 记 `kind: review`。审核状态持久化在 `协作/调度台/review-<编号>.status.json`，页面轮询 `GET /api/task/<编号>/review-status`。审核线程以 **`对接/审查.md` + `对接/审核完成.md` 落盘且结论可识别** 作为完成判据；失败写 `review_failed`、错误与日志路径，可重试。审核与分发共用单实例锁，互斥运行。
+14. **审核**：`POST /review/<编号>` 先预检所有已有子任务均为 `delivered`/`passed`，并且存在任务级交付（`对接/交付/**/DONE.md`，无子任务时也接受工作区产物）；没有 `subtasks.yaml` 也可审核。再解析 `reviewer` 角色绑定的 Agent；任一不满足返回 409，不启动进程。启动时 `kind=review`；因为审核要同时读 `对接/` 与 `工作区/`，进程 cwd 是本任务的项目目录（`runner.launch(cwd=项目目录)`，仍是该任务自己的目录，不是值班台根），日志为 `工作区/日志/review-<时间戳>.log`，`runner.status` 记 `kind: review`。审核状态持久化在 `协作/调度台/review-<编号>.status.json`，页面轮询 `GET /api/task/<编号>/review-status`。**署名治理**：新审核的提示词强制审查.md 头部含 `- 审核角色：<role.name>（<agent.id>）`、`- 审查时间：…` 与结论行；终态校验要求角色名与本次绑定 Agent 一致。出现 `AI-A` 字样视为冒名，连同 `审核完成.md` 移入 `对接/审查历史/invalid-attribution-<时间>.md`，状态 `review_failed`。新规则作用于 T24 起（2026-10-27 02:51）之后写入的审查，以及本次 review 状态带 `attribution_required` 的审查；早于该时刻的历史文件不改，继续按旧规则判定。审核线程以 **`对接/审查.md` + `对接/审核完成.md` 落盘且结论可识别** 作为完成判据；失败写 `review_failed`、错误与日志路径，可重试。若本轮产出空/半份/结论不可识别，该组文件会移入 `对接/审查历史/invalid-<时间>.md`（不删除）；手工重试一个已有无效审查的任务时也先隔离再启动，避免旧文件挡路。审核与分发共用单实例锁，互斥运行。
 
-15. **全自动推进**：`POST /advance/<编号>` 启动一个推进线程，按「继续分发（pending/failed）→ 自动审核」循环，直到审核通过、须修正或任一步失败。推进状态写 `协作/调度台/advance-<编号>.status.json`，可由 `GET /api/task/<编号>/advance-status` 轮询；分发/审核本身仍分别复用 `runner.lock`，不额外启动进程。发布页勾选 `auto_advance`（默认开启）时，登记成功回调会在登记锁释放后自动启动推进；进度/失败原因写入同一状态文件。
+15. **全自动推进**：`POST /advance/<编号>` 启动一个推进线程，按「继续分发（pending/failed）→ 自动审核」循环，直到审核通过、须修正或任一步失败。推进状态写 `协作/调度台/advance-<编号>.status.json`，可由 `GET /api/task/<编号>/advance-status` 轮询；分发/审核本身仍分别复用 `runner.lock`，不额外启动进程。**停止与预算**：`POST /advance/<编号>/stop` 由用户显式触发，写 `stop_requested`，终止当前 Agent 进程组并等待锁释放；停止后不会自动重新拉起。推进预算默认最长 2 小时、最多 12 个子任务、最多 3 轮修订（可用命令行/环境变量调整），每次启动子任务前检查；超限停止为 `stopped_with_budget`，页面显示原因与已用额度，锁同样释放。发布页勾选 `auto_advance`（默认开启）时，登记成功回调会在登记锁释放后自动启动推进；进度/失败原因写入同一状态文件。
 
-16. **继续修正（重修）**：`POST /revise/<编号>` 只在 `phase=revise` 时通过。预检包括：问题清单解析、受影响子任务角色绑定、reviewer 绑定、执行器空闲、无其它推进/分发/审核/登记、G3 审核完成闸门。通过后把本轮 `对接/审查.md` 复制为 `对接/审查历史/round-<n>.md`（同时快照 `审核完成.md`；原件不删除），把问题清单命中的 **delivered** 子任务重置为 pending（已通过项默认不重跑；`mode=all` 时才连同 passed 一起重置；未命中时按 `mode=all|review` 处理），把 `revise_round=n` 写回 `task.yaml`，然后直接调用既有推进流程：分发剩余 → 自动审核。结果通过则阶段变为 `passed`；仍须修正则停在 `revise`，`revise_round` 已 +1；任一失败则停止。默认上限 3 轮，超过后按钮禁用，`POST` 返回 `409` + 请人工介入。修订记录写 `工作区/日志/revise-<时间戳>.log`，状态写同一 `advance-<编号>.status.json`（`revise=true`），可由 `GET /api/task/<编号>/revise-status` 轮询。审核线程只接受本轮新写入的 `审查.md` / `审核完成.md`（mtime+sha256 与基线不同），避免把上一轮结论误认为修正结果；本轮审核成功后还会检查 G4（`round-<n>.md` 与新一轮结论）。
+16. **继续修正（重修）**：`POST /revise/<编号>` 只在 `phase=revise` 时通过。预检包括：问题清单解析、受影响子任务角色绑定、reviewer 绑定、执行器空闲、无其它推进/分发/审核/登记、G3 审核完成闸门。通过后把本轮 `对接/审查.md` 复制为 `对接/审查历史/round-<n>.md`（同时快照 `审核完成.md`；原件不删除），把问题清单命中的 **delivered** 子任务重置为 pending（已通过项默认不重跑；`mode=all` 时才连同 passed 一起重置；未命中时按 `mode=all|review` 处理），把 `revise_round=n` 写回 `task.yaml`，生成**修订上下文**（父任务单绝对路径与禁止事项、本轮问题清单全文及命中本子任务的原文、`审查历史/round-n.md` 绝对快照路径与轮次、回归验收要求），随 advance/dispatch 状态传给每个被重置子任务的固定提示词，然后直接调用既有推进流程：分发剩余 → 自动审核。结果通过则阶段变为 `passed`；仍须修正则停在 `revise`，`revise_round` 已 +1；任一失败则停止。默认上限 3 轮，超过后按钮禁用，`POST` 返回 `409` + 请人工介入。修订记录写 `工作区/日志/revise-<时间戳>.log`，状态写同一 `advance-<编号>.status.json`（`revise=true`），可由 `GET /api/task/<编号>/revise-status` 轮询。审核线程只接受本轮新写入的 `审查.md` / `审核完成.md`（mtime+sha256 与基线不同），避免把上一轮结论误认为修正结果；本轮审核成功后还会检查 G4（`round-<n>.md` 与新一轮结论）。
 
 17. **交接闸门与补交**：G1–G4 在任何分发、审核、修正前后执行（见「交接闸门」）。每次检查/补交开启一条 `工作区/日志/handoff-<时间戳>.log`，状态持久化在 `协作/调度台/handoff-<编号>.status.json`；每次补交复用 `runner.launch(kind=handoff)` 与 `runner.lock`，最多 2 次。仍缺则 `advance` 状态写 `handoff_blocked`（页面阶段 `handoff_blocked`、任务状态「需处理」），缺件与责任 Agent 写入状态/日志，避免静默继续。补交提示词固定要求只补缺件，非 reviewer 一律禁止写 `对接/审查.md`。
 
@@ -251,10 +257,10 @@ subtasks:
 隔离测试：
 
 ```bash
-python3 -m unittest -v console/test_runner.py console/test_registration.py console/test_dispatch.py console/test_review.py console/test_advance.py console/test_revise.py console/test_handoff.py
+python3 -m unittest -v console/test_runner.py console/test_registration.py console/test_dispatch.py console/test_review.py console/test_advance.py console/test_revise.py console/test_handoff.py console/test_audit_p1.py
 ```
 
-`test_runner.py` 覆盖成功退出、并发拒绝、超时进程组清理、正常退出后的后台子进程清理、崩溃/非零退出、失效锁回收、活锁不被 reconcile 改写、任务编号与目录一致性、状态与日志、历史截取和归档日志回退、**cwd=workdir、产物落外部目录、日志留值班台、相对/系统根/协作 workdir 拒绝**，以及总控登记复用锁、超时释放锁。`test_registration.py` 在临时仓库中把一次登记运行到 `register_failed`，再重试到 `registered`，校验 2 个子任务、完成信号、日志和看板读取。`test_dispatch.py` 覆盖详情页无 Agent 选择器、预检 409 且零启动、两子任务串行与状态回写、单实例互斥、失败停止后续、日志链接与 runner.status `kind=dispatch`。`test_review.py` 覆盖全部交付后详情页切换为「开始审核」、无子任务但存在任务级 DONE/工作区产物的审核、`/api/tasks` 阶段与 x/y 字段、审核串行与 `kind=review`、通过/须修正两种结论与问题清单摘要、未绑定 reviewer 的 409、审核失败日志与重试、审核期间拒绝分发。`test_advance.py` 用假总控/假 Agent 覆盖全自动推进到通过、须修正即停、分发失败即停、审核失败即停，以及发布时默认勾选 `auto_advance` 后无需人工点击即可完成登记→分发→审核；并校验串行锁与无并发 Agent。`test_revise.py` 覆盖须修正详情页按钮/问题清单/目标子任务、只重置受影响子任务并自动推进到通过（未受影响的子任务不重跑）、问题清单无编号时 409 二选一、`review`/`all` 两种策略、affected 模式跳过已通过项 / all 模式连已通过项一起重做、3 轮上限禁用与 409、审查历史 round-1/2/3 落盘、`revise_round` 写回 `task.yaml`、`revise-*.log`、HTML 表单 303 回详情与 `/api/tasks` 扩展字段。`test_handoff.py` 用假 Agent 覆盖 G2 缺 DONE.md 时自动回叫补齐后继续审核、连续两次补不齐进入 `handoff_blocked` 并停止、页面缺件清单与「重试体检」、G1/G3/G4 缺件样例的责任方、审核后 G3 自动补交、`/api/tasks` 阶段/status 派生与 `_delivery_evidence()`，并校验串行锁无重叠。测试都不触碰真实的 `项目/`、`协作/` 或 8787。
+`test_runner.py` 覆盖成功退出、并发拒绝、超时进程组清理、正常退出后的后台子进程清理、崩溃/非零退出、失效锁回收、活锁不被 reconcile 改写、任务编号与目录一致性、状态与日志、历史截取和归档日志回退、**cwd=workdir、产物落外部目录、日志留值班台、相对/系统根/协作 workdir 拒绝**，以及总控登记复用锁、超时释放锁。`test_registration.py` 在临时仓库中把一次登记运行到 `register_failed`，再重试到 `registered`，校验 2 个子任务、完成信号、日志和看板读取。`test_dispatch.py` 覆盖详情页无 Agent 选择器、预检 409 且零启动、两子任务串行与状态回写、单实例互斥、失败停止后续、日志链接与 runner.status `kind=dispatch`。`test_review.py` 覆盖全部交付后详情页切换为「开始审核」、无子任务但存在任务级 DONE/工作区产物的审核、`/api/tasks` 阶段与 x/y 字段、审核串行与 `kind=review`、通过/须修正两种结论与问题清单摘要、未绑定 reviewer 的 409、审核失败日志与重试、审核期间拒绝分发，以及 T24 署名三例（正确头部通过、AI-A 冒名拒收并隔离到 `invalid-attribution-*.md`、缺头部不进终态且可重试）。`test_advance.py` 用假总控/假 Agent 覆盖全自动推进到通过、须修正即停、分发失败即停、审核失败即停，以及发布时默认勾选 `auto_advance` 后无需人工点击即可完成登记→分发→审核；并校验串行锁与无并发 Agent；T24 另覆盖用户停止（终止 Agent + 释放锁）、子任务/运行时长/修订轮次三类预算停止为 `stopped_with_budget` 且无半锁。`test_revise.py` 覆盖须修正详情页按钮/问题清单/目标子任务、只重置受影响子任务并自动推进到通过（未受影响的子任务不重跑）、问题清单无编号时 409 二选一、`review`/`all` 两种策略、affected 模式跳过已通过项 / all 模式连已通过项一起重做、3 轮上限禁用与 409、审查历史 round-1/2/3 落盘、`revise_round` 写回 `task.yaml`、`revise-*.log`、HTML 表单 303 回详情与 `/api/tasks` 扩展字段。`test_handoff.py` 用假 Agent 覆盖 G2 缺 DONE.md 时自动回叫补齐后继续审核、连续两次补不齐进入 `handoff_blocked` 并停止、页面缺件清单与「重试体检」、G1/G3/G4 缺件样例的责任方、审核后 G3 自动补交、`/api/tasks` 阶段/status 派生与 `_delivery_evidence()`，并校验串行锁无重叠。`test_audit_p1.py` 是 T19 外部审计回归：F01 空/半份/不可识别审查不进终态、运行中优先、重试隔离 invalid 文件；F02 归档→恢复逐字段保留（含未知扩展）；F03 无活锁 running 置 `interrupted` 且保留 log/run_id、活锁不动、恢复后可继续分发；F04 修订提示词包含父任务单/禁止事项/问题原文/快照/轮次/回归验收且不同于首次提示词；F05 默认与外部 workdir 都按提示词绝对路径交付并通过 G2。测试都不触碰真实的 `项目/`、`协作/` 或 8787。
 
 ## 写入边界
 

@@ -25,7 +25,7 @@ open "desktop/build/CollabMenuBar.app"
 ## 菜单
 
 ```text
-控制台：● 运行中 / ○ 已停止 / ◌ 重启中
+控制台：● 运行中 · 已重启 N 次 / ○ 已停止 · 已重启 N 次 / ◌ 重启中…
 启动控制台 · 停止控制台 · 重启控制台
 打开网页（http://127.0.0.1:8787）
 守卫：● 常驻中 / ○ 已停止
@@ -36,7 +36,8 @@ open "desktop/build/CollabMenuBar.app"
 
 - **启动控制台**：以 `/usr/bin/env python3 console/server.py` 起子进程，日志追加到 `协作/调度台/console.log`。
 - **停止控制台**：先 SIGTERM，宽限后 SIGKILL；只停止自己启动的进程。若 8787 被外部启动的进程占用，菜单显示「运行中（外部）」，不会贸然终止。
-- **控制台崩溃**：自动重启，退避 1 / 2 / 4 / 8 / 16 / 30 秒；连续崩溃不会空转。
+- **控制台看护**：应用内 `DispatchSourceTimer` 每 **2 秒**做一次 TCP 健康检查（`127.0.0.1:8787`，测试可用 `COLLAB_CONSOLE_PORT` 指向假实例）。端口不可达时终止仍在运行但无响应的受控进程，按 **1 / 2 / 4 / 8 / 16 / 30 秒**退避重启 `python3 console/server.py --port <端口>`；每次自动重启都写 `console.log`（次数 + 时间），菜单显示「已重启 N 次」。连续崩溃不会空转。
+- **手动停止优先**：点「停止控制台」后 `wantsToRun=false`，看护循环不再自动拉起；重新点「启动控制台」或「重启控制台」才恢复。8787 若由外部进程监听，应用不会终止它。
 - **启动守卫**：应用启动时会自动开始常驻守卫；菜单可以停止 / 恢复。
 - **守卫循环**：每轮运行 `bash 协作/调度台/watch.sh 7200`。
   - 有变化（`RESULT=CHANGE`）：追加时间 + watch 原样输出到 journal.log，自动运行 `ack.sh` 刷新 `watch.state` 基线（同时留下快照），然后**立即**重挂。
@@ -75,6 +76,20 @@ open "collab-menubar://quit?token=$TOKEN"
 - 令牌文件权限为 `0600`，每次应用启动重新生成，位于 `协作/调度台/menubar.control-token`，不由网页服务提供。
 - 未携带有效令牌的 URL 命令会被忽略并记入 `console.log`，网页无法借此启动/停止/退出应用。
 - 这不是网络监听，也不启动开机自启；正常使用直接点菜单。
+
+## 看护循环自检（8790 假实例）
+
+`--watchdog-selftest` 使用同一个 `ConsoleController` 和看护循环，对 8790 端口上的
+Python 假实例做两次 `kill -9`，验证 ≤10 秒恢复（TCP 可达且 `GET /` 返回 200）、
+重启次数/时间落日志，再验证手动停止后不再自动拉起；不会触碰 8787：
+
+```bash
+bash desktop/build.sh
+./desktop/build/CollabMenuBar.app/Contents/MacOS/CollabMenuBar --watchdog-selftest
+# 看到 WATCHDOG-SELFTEST PASS 即通过
+```
+
+自检只写系统临时目录，退出时清理。可用 `COLLAB_SELFTEST_PORT` 换端口（默认 8790）。
 
 ## 源码
 

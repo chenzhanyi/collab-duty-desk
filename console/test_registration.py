@@ -87,7 +87,8 @@ if mode in {"partial", "slow"}:
     f"    title: 子任务二\n"
     f"    goal: 做第二件事\n"
     f"    acceptance: 第二件事可验收\n"
-    f"    status: pending\n",
+    f"    status: pending\n"
+    f"    agent_role: designer\n",
     encoding="utf-8",
 )
 (docking / "登记完成.md").write_text(
@@ -122,6 +123,16 @@ class RegistrationTest(unittest.TestCase):
             "id: controller\n"
             "name: 测试总控\n"
             "description: 隔离测试\n"
+            "agent_id: fake-controller\n"
+            "write_scope: []\n"
+            "enabled: true\n"
+            'notes: ""\n',
+            encoding="utf-8",
+        )
+        (roles / "designer.yaml").write_text(
+            "id: designer\n"
+            "name: 测试设计\n"
+            "description: 登记角色校验\n"
             "agent_id: fake-controller\n"
             "write_scope: []\n"
             "enabled: true\n"
@@ -307,9 +318,11 @@ class RegistrationTest(unittest.TestCase):
             "  - id: T71-1\n"
             "    title: 一\n"
             "    status: pending\n"
+            "    agent_role: designer\n"
             "  - id: T71-2\n"
             "    title: 二\n"
-            "    status: pending\n",
+            "    status: pending\n"
+            "    agent_role: designer\n",
             encoding="utf-8",
         )
         (docking / "登记完成.md").write_text("旧完成\n", encoding="utf-8")

@@ -90,6 +90,10 @@ try:
         docking = project / "对接"
         task_match = re.search(r"任务：(T\d+)", prompt)
         task_id = task_match.group(1) if task_match else "T00"
+        attempt_match = re.search(r"attempt:\s*(\d+)", prompt)
+        attempt_line = (
+            "attempt: %s\n" % attempt_match.group(1) if attempt_match else ""
+        )
         subtasks_path = docking / "subtasks.yaml"
         if not subtasks_path.is_file():
             subtasks_path.write_text(
@@ -120,7 +124,8 @@ try:
                     continue
                 done = outdir / "DONE.md"
                 content = done.read_text(encoding="utf-8") if done.is_file() else ""
-                if not all(
+                needs_attempt = bool(attempt_line) and "attempt:" not in content
+                if needs_attempt or not all(
                     marker in content
                     for marker in ("做了什么", "怎么验", "结果")
                 ):
@@ -128,7 +133,8 @@ try:
                         "# DONE %s\n\n"
                         "## 做了什么\n\n- 交接补交\n\n"
                         "## 怎么验\n\n- 读取产物并核对\n\n"
-                        "## 结果\n\n- 通过\n" % outdir.name,
+                        "## 结果\n\n- 通过\n"
+                        "%s" % (outdir.name, attempt_line),
                         encoding="utf-8",
                     )
                 products = [
@@ -148,11 +154,16 @@ try:
                 path.write_text(
                     "# 登记完成\n\n- 交接补交写入\n", encoding="utf-8"
                 )
+        attribution = re.search(
+            r"^- 审核角色：[^\n]*\n- 审查时间：[^\n]*", prompt, re.M
+        )
+        header = (attribution.group(0) + "\n\n") if attribution else ""
         if "review_complete" in prompt or "revise_" in prompt:
             review = docking / "审查.md"
             if not review.is_file():
                 review.write_text(
-                    "# 审查\n\n## 结论\n\n结论：**通过**\n\n"
+                    header
+                    + "# 审查\n\n## 结论\n\n结论：**通过**\n\n"
                     "## 逐项证据\n\n- 交接补交核对\n",
                     encoding="utf-8",
                 )
@@ -173,6 +184,10 @@ try:
     if "你是审核角色" in prompt:
         task_match = re.search(r"审核任务 (T\d+)", prompt)
         task_id = task_match.group(1) if task_match else "unknown"
+        attribution = re.search(
+            r"^- 审核角色：[^\n]*\n- 审查时间：[^\n]*", prompt, re.M
+        )
+        header = (attribution.group(0) + "\n\n") if attribution else ""
         record("review start %s pid=%d" % (task_id, os.getpid()))
         review_match = re.search(r"绝对路径：(\S+?/审查\.md)", prompt)
         done_match = re.search(r"绝对路径：(\S+?/审核完成\.md)", prompt)
@@ -182,7 +197,8 @@ try:
         review_path = Path(review_match.group(1))
         done_path = Path(done_match.group(1))
         review_path.write_text(
-            "# 审查\n\n## 结论\n\n结论：**通过**\n\n"
+            header
+            + "# 审查\n\n## 结论\n\n结论：**通过**\n\n"
             "## 逐项证据\n\n- 自动推进验收\n\n"
             "## 问题清单\n\n- 无\n",
             encoding="utf-8",

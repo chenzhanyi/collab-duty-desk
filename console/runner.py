@@ -85,6 +85,7 @@ class _ActiveRun:
     log_handle: BinaryIO
     lock_token: str
     stop_reason: str = ""
+    task_id: str = ""
 
 
 def build_prompt(
@@ -536,7 +537,7 @@ class Runner:
             raise RunnerConfigError("交付轮次必须是正整数。") from exc
         if round_value < 1:
             raise RunnerConfigError("交付轮次必须是正整数。")
-        if kind not in {"run", "dispatch", "review", "handoff"}:
+        if kind not in {"run", "dispatch", "review", "handoff", "whole_rework"}:
             raise RunnerConfigError("未知的执行类型。")
         if kind == "dispatch" and not str(subtask_id).strip():
             raise RunnerConfigError("分发子任务缺少编号。")
@@ -743,6 +744,7 @@ class Runner:
                 log_path=log_path,
                 log_handle=log_handle,
                 lock_token=token,
+                task_id=task_id,
             )
             with self._mutex:
                 self._active = active
@@ -925,6 +927,7 @@ class Runner:
                 log_path=log_path,
                 log_handle=log_handle,
                 lock_token=token,
+                task_id=task_id,
             )
             with self._mutex:
                 self._registration = active
@@ -1674,6 +1677,63 @@ class Runner:
     def wait_for_idle(self, timeout: Optional[float] = None) -> bool:
         """测试/收尾用：等待当前实例的监视线程结束。"""
         return self._idle.wait(timeout)
+
+    def stop_active(self, reason: str, *, task_id: str = "") -> bool:
+        """终止当前受控运行并等待锁释放；用于用户停止推进。
+
+        只停止本执行器实例持有的运行。task_id 非空时，任务不匹配则不动。
+        监视线程会记录 stop_reason、写终态并释放 runner.lock；超时后兜底
+        释放同一 token 的锁，避免留下半锁。
+        """
+        with self._mutex:
+            active = self._active
+            registration = self._registration
+        target = active or registration
+        if target is None:
+            return False
+        if (
+            task_id
+            and target.task_id
+            and target.task_id.upper() != task_id.strip().upper()
+        ):
+            return False
+
+        target.stop_reason = reason or "用户请求停止"
+        self._terminate(target.process)
+        if target is registration:
+            self.wait_for_registration_idle(TERMINATE_GRACE_SECONDS * 2 + 2.0)
+        else:
+            self.wait_for_idle(TERMINATE_GRACE_SECONDS * 2 + 2.0)
+        # 监视线程通常已释放；这里兜底清理同一 token 的锁。
+        self.release_stale_lock_for_task(target.task_id or task_id)
+        return True
+
+    def release_stale_lock_for_task(self, task_id: str) -> bool:
+        """仅当锁属于本进程、指定任务且 Agent 进程已死时释放。"""
+        mapping, stat = self._read_lock_file()
+        if stat is None:
+            return False
+        if (
+            task_id
+            and str(mapping.get("task") or "").upper() != task_id.strip().upper()
+        ):
+            return False
+        if _as_int(mapping.get("owner_pid")) != os.getpid():
+            return False
+        agent_pid = _as_int(mapping.get("agent_pid"))
+        if _pid_alive(agent_pid):
+            return False
+        # 锁刚创建、尚未写入 agent_pid 时是启动中的活锁，不能误清。
+        if not agent_pid and time.time() - stat.st_mtime < EMPTY_LOCK_GRACE_SECONDS:
+            return False
+        token = str(mapping.get("token") or "")
+        if not token:
+            return False
+        self._release_lock(token)
+        try:
+            return not self.lock_path.exists()
+        except OSError:
+            return False
 
     def shutdown(self) -> None:
         """服务正常退出时终止当前执行组，让锁与状态有明确收尾。"""

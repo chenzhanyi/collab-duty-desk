@@ -50,6 +50,8 @@ import time
 prompt = sys.argv[1] if len(sys.argv) > 1 else ""
 match = re.search(r"执行子任务 (T\\d+-\\d+)：", prompt)
 subtask = match.group(1) if match else "unknown"
+attempt_match = re.search(r"attempt:\\s*(\\d+)", prompt)
+attempt_line = ("attempt: %s\\n" % attempt_match.group(1)) if attempt_match else ""
 order = os.environ.get("T10_ORDER_FILE", "")
 held = os.environ.get("T10_HELD_FILE", "")
 
@@ -80,7 +82,8 @@ try:
             "## 做了什么\\n\\n- 假 Agent 执行子任务\\n\\n"
             "## 怎么验\\n\\n- 检查产物\\n\\n"
             "## 结果\\n\\ncwd=%s\\n"
-            % (subtask, os.getcwd())
+            "%s"
+            % (subtask, os.getcwd(), attempt_line)
         )
     with open(os.path.join(outdir, "result.txt"), "w", encoding="utf-8") as handle:
         handle.write("subtask=%s\\n" % subtask)

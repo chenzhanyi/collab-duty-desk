@@ -95,8 +95,17 @@ try:
         if revise
         else "- 无"
     )
+    attribution = re.search(
+        r"^- 审核角色：[^\\n]*\\n- 审查时间：[^\\n]*", prompt, re.M
+    )
+    header = (attribution.group(0) + "\\n\\n") if attribution else ""
+    if mode == "noheader":
+        header = ""
+    elif mode == "impersonate":
+        header = "- 审核角色：AI-A（demo-reviewer）\\n- 审查时间：2026-10-27 00:00:00\\n\\n"
     body = (
-        "# 审查\\n\\n"
+        header
+        + "# 审查\\n\\n"
         "## 结论\\n\\n结论：**%s**\\n\\n"
         "## 逐项证据\\n\\n"
         "- 任务单与 subtasks.yaml 已读取\\n"
@@ -737,6 +746,146 @@ class ReviewTest(unittest.TestCase):
             order = self.order_file.read_text(encoding="utf-8").splitlines()
         self.assertTrue(all("T66" in line for line in order), order)
         self.assertFalse(any(line.startswith("overlap") for line in order))
+
+
+    def test_new_manual_review_requires_header_but_legacy_file_is_grandfathered(
+        self,
+    ) -> None:
+        project = self.make_task("T77", ["delivered"])
+        review_path, done_path = self.review_files(project)
+        headerless = "# 审查\n\n## 结论\n\n结论：**通过**\n"
+        review_path.write_text(headerless, encoding="utf-8")
+        done_path.write_text("审核完成\n", encoding="utf-8")
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T77")), (False, "")
+        )
+
+        review_path.write_text(
+            "- 审核角色：审核（demo-reviewer）\n"
+            "- 审查时间：2026-10-27 03:00:00\n"
+            + headerless,
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T77")), (True, "passed")
+        )
+
+        review_path.write_text(headerless, encoding="utf-8")
+        os.utime(review_path, (0, 0))
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T77")), (True, "passed")
+        )
+
+    def test_review_attribution_header_passes_and_is_stored(self) -> None:
+        project = self.make_task("T74", ["delivered"])
+        self.find_task("T74")
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/review/T74", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        final = self.wait_review("T74")
+        self.assertEqual(final["state"], "completed", final)
+        self.assertEqual(final["conclusion"], "passed", final)
+        self.assertTrue(final.get("attribution_required"), final)
+        self.assertEqual(final.get("attribution_agent"), "demo-reviewer")
+
+        review_path, done_path = self.review_files(project)
+        text = review_path.read_text(encoding="utf-8")
+        self.assertIn("- 审核角色：审核（demo-reviewer）", text)
+        self.assertIn("- 审查时间：", text)
+        self.assertNotIn("AI-A", text)
+        task = self.find_task("T74")
+        self.assertEqual(server._review_terminal_state(task), (True, "passed"))
+
+        log_path = server.RUNNER.resolve_log(final.get("log"))
+        self.assertIsNotNone(log_path)
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("- 审核角色：审核（demo-reviewer）", log_text)
+        self.assertIn("- 审查时间：", log_text)
+        self.assertIn("不得自称 AI-A", log_text)
+
+    def test_review_ai_a_impersonation_is_rejected_and_quarantined(self) -> None:
+        project = self.make_task("T75", ["delivered"])
+        self.find_task("T75")
+        os.environ["T13_MODE"] = "impersonate"
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/review/T75", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        final = self.wait_review("T75")
+        self.assertEqual(final["state"], "review_failed", final)
+        self.assertEqual(final.get("attribution_issue"), "impersonation")
+        self.assertIn("AI-A", str(final.get("error") or ""))
+        self.assertIn("拒收", str(final.get("message") or ""))
+
+        review_path, done_path = self.review_files(project)
+        self.assertFalse(review_path.exists(), "冒名审查不应留在对接/")
+        self.assertFalse(done_path.exists(), "配套完成信号应一起隔离")
+        history = [
+            path
+            for path in (project / "对接" / "审查历史").glob(
+                "invalid-attribution-*.md"
+            )
+            if "审核完成" not in path.name
+        ]
+        self.assertEqual(len(history), 1, history)
+        self.assertIn("AI-A", history[0].read_text(encoding="utf-8"))
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T75")), (False, "")
+        )
+        self.assertFalse(server.RUNNER.lock_path.exists())
+
+    def test_review_missing_attribution_header_never_becomes_terminal(self) -> None:
+        project = self.make_task("T76", ["delivered"])
+        self.find_task("T76")
+        os.environ["T13_MODE"] = "noheader"
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/review/T76", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        final = self.wait_review("T76")
+        self.assertEqual(final["state"], "review_failed", final)
+        self.assertEqual(final.get("attribution_issue"), "missing_role")
+        self.assertIn("审核角色", str(final.get("error") or ""))
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T76")), (False, "")
+        )
+        status, body, _headers = self.request(
+            "GET", "/api/task/T76/review-status", accept="application/json"
+        )
+        self.assertEqual(status, 200)
+        api_state = json.loads(body)
+        self.assertTrue(api_state["attribution_required"])
+        self.assertEqual(api_state["attribution_issue"], "missing_role")
+        review_path, done_path = self.review_files(project)
+        self.assertFalse(review_path.exists())
+        self.assertFalse(done_path.exists())
+        history = [
+            path
+            for path in (project / "对接" / "审查历史").glob(
+                "invalid-attribution-*.md"
+            )
+            if "审核完成" not in path.name
+        ]
+        self.assertEqual(len(history), 1, history)
+        self.assertFalse(server.RUNNER.lock_path.exists())
+
+        os.environ["T13_MODE"] = "pass"
+        status, body, _headers = self.request(
+            "POST", "/review/T76", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        retried = self.wait_review("T76")
+        self.assertEqual(retried["state"], "completed", retried)
+        self.assertEqual(
+            server._review_terminal_state(self.find_task("T76")), (True, "passed")
+        )
 
 
 if __name__ == "__main__":

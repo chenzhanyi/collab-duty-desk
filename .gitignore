@@ -1,13 +1,21 @@
-__pycache__/
-*.pyc
+!协作/调度台/ack.sh
+!协作/调度台/watch.sh
+# 调度台只纳入运行脚本；锁、状态、日志、快照、令牌均为运行态，不入库
 *.bak
 *.bak-*
+*.log
+*.pyc
 .DS_Store
-desktop/build/
+__pycache__/
 console/验收记录.md
-项目/
-归档/
-# 调度台只纳入运行脚本；锁、状态、日志、快照、令牌均为运行态，不入库
+desktop/build/
 协作/调度台/*
-!协作/调度台/watch.sh
-!协作/调度台/ack.sh
+协作/调度台/guard.status
+协作/调度台/journal.log
+协作/调度台/menubar.control-token
+协作/调度台/runner.history.jsonl
+协作/调度台/runner.status
+协作/调度台/snapshots/
+协作/调度台/watch.state
+归档/
+项目/

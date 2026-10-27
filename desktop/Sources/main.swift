@@ -7,7 +7,17 @@ import Foundation
 // -----------------------------------------------------------------------------
 
 enum RuntimePaths {
-    static let consolePort: UInt16 = 8787
+    /// 默认 8787；自动化测试可用 COLLAB_CONSOLE_PORT=8790 指向假实例。
+    static let consolePort: UInt16 = {
+        if
+            let raw = ProcessInfo.processInfo.environment["COLLAB_CONSOLE_PORT"],
+            let value = UInt16(raw),
+            value >= 1024
+        {
+            return value
+        }
+        return 8787
+    }()
     static let watchSeconds = 7200
     static let guardRestartDelay: TimeInterval = 3
 
@@ -188,7 +198,7 @@ enum GuardStatusFile {
 }
 
 enum PortProbe {
-    /// 不发起 HTTP 请求，只检查 127.0.0.1:8787 是否在监听。
+    /// 不发起 HTTP 请求，只检查 127.0.0.1:<port> 是否在监听（TCP 健康检查）。
     static func isOpen(_ port: UInt16) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
@@ -341,10 +351,21 @@ final class ConsoleController {
         let ownedPID: pid_t?
         let portOpen: Bool
         let restarting: Bool
+        let restartCount: Int
+        let lastRestartAt: Date?
+        let healthFailures: Int
+        let wantsToRun: Bool
 
         var running: Bool { ownedPID != nil || portOpen }
         var external: Bool { portOpen && ownedPID == nil }
     }
+
+    private let port: UInt16
+    private let consoleScript: URL
+    private let consoleLogURL: URL
+    private let projectRoot: URL
+    private let watchdogInterval: TimeInterval
+    private let startupGrace: TimeInterval
 
     private var process: Process?
     private var outputHandle: FileHandle?
@@ -355,24 +376,136 @@ final class ConsoleController {
     private var restartAfterTermination = false
     private var shuttingDown = false
     private var launchedAt: Date?
+    private var watchdog: DispatchSourceTimer?
+    private var healthFailures = 0
+    private var restartCount = 0
+    private var lastRestartAt: Date?
 
     var onChange: (() -> Void)?
+
+    init(
+        port: UInt16 = RuntimePaths.consolePort,
+        consoleScript: URL = RuntimePaths.consoleScript,
+        consoleLogURL: URL = RuntimePaths.consoleLog,
+        projectRoot: URL = RuntimePaths.projectRoot,
+        watchdogInterval: TimeInterval = 2.0,
+        startupGrace: TimeInterval = 6.0
+    ) {
+        self.port = port
+        self.consoleScript = consoleScript
+        self.consoleLogURL = consoleLogURL
+        self.projectRoot = projectRoot
+        self.watchdogInterval = watchdogInterval
+        self.startupGrace = startupGrace
+    }
 
     func snapshot() -> Snapshot {
         let alive = process?.isRunning == true
         let ownedPID = alive ? process?.processIdentifier : nil
-        let portOpen = PortProbe.isOpen(RuntimePaths.consolePort)
-        return Snapshot(ownedPID: ownedPID, portOpen: portOpen, restarting: restartWork != nil)
+        let portOpen = PortProbe.isOpen(port)
+        return Snapshot(
+            ownedPID: ownedPID,
+            portOpen: portOpen,
+            restarting: restartWork != nil,
+            restartCount: restartCount,
+            lastRestartAt: lastRestartAt,
+            healthFailures: healthFailures,
+            wantsToRun: wantsToRun
+        )
     }
+
+    private func log(_ message: String) {
+        let line = "[菜单栏] \(Clock.display()) \(message)\n"
+        if !FileIO.appendDirect(line, to: consoleLogURL) {
+            FileIO.append(line, to: RuntimePaths.consoleLog)
+        }
+    }
+
+    // MARK: 真实看护循环
+
+    /// 每 2 秒检查 TCP 健康；不可达则终止无响应进程并按 1/2/4/8/16/30 秒退避重启。
+    func startWatchdog() {
+        guard watchdog == nil, !shuttingDown else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + watchdogInterval,
+            repeating: watchdogInterval,
+            leeway: .milliseconds(200)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.healthTick()
+        }
+        watchdog = timer
+        timer.resume()
+        log("控制台看护已启动：每 \(Int(watchdogInterval)) 秒检查 127.0.0.1:\(port)")
+    }
+
+    private func stopWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
+    }
+
+    private func healthTick() {
+        guard !shuttingDown, wantsToRun else { return }
+        if PortProbe.isOpen(port) {
+            if healthFailures > 0 {
+                log("健康检查恢复：127.0.0.1:\(port) 可达。")
+            }
+            healthFailures = 0
+            if let work = restartWork, process?.isRunning == true {
+                work.cancel()
+                restartWork = nil
+                log("控制台已恢复，取消待执行的重启。")
+                onChange?()
+            }
+            return
+        }
+
+        healthFailures += 1
+        if let process, process.isRunning {
+            let uptime = launchedAt.map { Date().timeIntervalSince($0) } ?? 0
+            if uptime < startupGrace {
+                return
+            }
+            let pid = process.processIdentifier
+            log(
+                "健康检查失败（第 \(healthFailures) 次）：127.0.0.1:\(port) 不可达，"
+                + "受控进程 PID \(pid) 仍存活（已运行 \(Int(uptime)) 秒），先终止再退避重启。"
+            )
+            stopping = false
+            process.terminate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak process] in
+                guard
+                    let self,
+                    let process,
+                    self.process === process,
+                    process.isRunning
+                else { return }
+                kill(process.processIdentifier, SIGKILL)
+                self.log("PID \(pid) 未在 1.5 秒内退出，已强制结束。")
+            }
+            scheduleRestart()
+            onChange?()
+            return
+        }
+
+        if healthFailures == 1 {
+            log("健康检查失败（第 1 次）：127.0.0.1:\(port) 不可达且无受控进程，安排退避重启。")
+        }
+        scheduleRestart()
+        onChange?()
+    }
+
+    // MARK: 启停
 
     func start(manual: Bool) {
         guard !shuttingDown else { return }
         if process?.isRunning == true {
-            ConsoleTextLog.line("控制台已在运行，忽略重复启动。")
+            log("控制台已在运行，忽略重复启动。")
             return
         }
-        if PortProbe.isOpen(RuntimePaths.consolePort) {
-            ConsoleTextLog.line("端口 \(RuntimePaths.consolePort) 已被其他进程占用，未启动新控制台。")
+        if PortProbe.isOpen(port) {
+            log("端口 \(port) 已被其他进程占用，未启动新控制台。")
             onChange?()
             return
         }
@@ -384,9 +517,9 @@ final class ConsoleController {
         }
         wantsToRun = true
         do {
-            try spawn()
+            try spawn(isAuto: !manual)
         } catch {
-            ConsoleTextLog.line("控制台启动失败：\(error.localizedDescription)")
+            log("控制台启动失败：\(error.localizedDescription)")
             onChange?()
             if manual {
                 wantsToRun = false
@@ -396,15 +529,15 @@ final class ConsoleController {
         }
     }
 
-    private func spawn() throws {
-        guard FileManager.default.fileExists(atPath: RuntimePaths.consoleScript.path) else {
+    private func spawn(isAuto: Bool) throws {
+        guard FileManager.default.fileExists(atPath: consoleScript.path) else {
             throw NSError(
                 domain: "CollabMenuBar",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "找不到 console/server.py"]
             )
         }
-        guard let logHandle = FileIO.openAppendHandle(RuntimePaths.consoleLog) else {
+        guard let logHandle = FileIO.openAppendHandle(consoleLogURL) else {
             throw NSError(
                 domain: "CollabMenuBar",
                 code: 2,
@@ -413,10 +546,14 @@ final class ConsoleController {
         }
 
         let newProcess = ProcessLauncher.makeDirect(
-            command: ["/usr/bin/env", "python3", RuntimePaths.consoleScript.path],
+            command: [
+                "/usr/bin/env", "python3", consoleScript.path,
+                "--port", String(port),
+            ],
             stdout: logHandle,
             stderr: logHandle
         )
+        newProcess.currentDirectoryURL = projectRoot
         newProcess.terminationHandler = { [weak self] exited in
             DispatchQueue.main.async {
                 self?.handleTermination(exited)
@@ -434,7 +571,13 @@ final class ConsoleController {
         outputHandle = logHandle
         stopping = false
         launchedAt = Date()
-        ConsoleTextLog.line("启动控制台（PID \(newProcess.processIdentifier)）：python3 console/server.py")
+        healthFailures = 0
+        log("启动控制台（PID \(newProcess.processIdentifier)）：python3 console/server.py --port \(port)")
+        if isAuto {
+            restartCount += 1
+            lastRestartAt = Date()
+            log("自动重启成功（第 \(restartCount) 次 · \(Clock.display())）：PID \(newProcess.processIdentifier)")
+        }
         onChange?()
     }
 
@@ -450,20 +593,21 @@ final class ConsoleController {
         launchedAt = nil
         let wasStopping = stopping
         stopping = false
+        healthFailures = 0
 
         if shuttingDown { return }
 
         if restartAfterTermination {
             restartAfterTermination = false
             wantsToRun = true
-            ConsoleTextLog.line("控制台 \(pid) 已停止，执行重启。")
+            log("控制台 \(pid) 已停止，执行手动重启。")
             start(manual: true)
             return
         }
 
         if wasStopping || !wantsToRun {
             wantsToRun = false
-            ConsoleTextLog.line("控制台已停止（PID \(pid)，\(reason)）。")
+            log("控制台已停止（PID \(pid)，\(reason)）。")
             onChange?()
             return
         }
@@ -471,7 +615,7 @@ final class ConsoleController {
         if uptime >= 20 {
             restartAttempt = 0
         }
-        ConsoleTextLog.line("控制台意外退出（PID \(pid)，\(reason)，运行 \(Int(uptime)) 秒）。")
+        log("控制台意外退出（PID \(pid)，\(reason)，运行 \(Int(uptime)) 秒）。")
         scheduleRestart()
         onChange?()
     }
@@ -488,10 +632,11 @@ final class ConsoleController {
     }
 
     private func scheduleRestart() {
-        restartWork?.cancel()
-        if PortProbe.isOpen(RuntimePaths.consolePort) {
+        guard !shuttingDown, wantsToRun else { return }
+        if restartWork != nil { return }
+        if PortProbe.isOpen(port) {
             wantsToRun = false
-            ConsoleTextLog.line("端口已被其他进程占用，取消控制台自动重启。")
+            log("端口已被其他进程占用，取消控制台自动重启。")
             onChange?()
             return
         }
@@ -499,18 +644,25 @@ final class ConsoleController {
         restartAttempt += 1
         let delays: [TimeInterval] = [1, 2, 4, 8, 16, 30]
         let delay = delays[min(restartAttempt - 1, delays.count - 1)]
-        ConsoleTextLog.line("将在 \(Int(delay)) 秒后自动重启控制台（退避第 \(restartAttempt) 档）。")
+        log("将在 \(Int(delay)) 秒后自动重启控制台（退避第 \(restartAttempt) 档）。")
 
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.restartWork = nil
-            guard !self.shuttingDown, self.wantsToRun, self.process?.isRunning != true else {
+            guard !self.shuttingDown, self.wantsToRun else { return }
+            if PortProbe.isOpen(self.port) {
+                self.wantsToRun = false
+                self.log("端口已被占用，放弃本次自动重启。")
+                self.onChange?()
                 return
             }
-            if PortProbe.isOpen(RuntimePaths.consolePort) {
-                self.wantsToRun = false
-                ConsoleTextLog.line("端口已被占用，放弃本次自动重启。")
-                self.onChange?()
+            if let process = self.process, process.isRunning {
+                let pid = process.processIdentifier
+                self.log("健康重启前进程 PID \(pid) 仍存活，强制结束并继续退避。")
+                kill(pid, SIGKILL)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.scheduleRestart()
+                }
                 return
             }
             self.start(manual: false)
@@ -526,11 +678,12 @@ final class ConsoleController {
         restartAfterTermination = false
         restartWork?.cancel()
         restartWork = nil
+        healthFailures = 0
 
         if let process, process.isRunning {
             stopping = true
             let pid = process.processIdentifier
-            ConsoleTextLog.line("正在停止控制台（PID \(pid)）。")
+            log("正在停止控制台（PID \(pid)）；手动停止后不再自动拉起。")
             process.terminate()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak process] in
                 guard
@@ -540,16 +693,16 @@ final class ConsoleController {
                     process.isRunning
                 else { return }
                 kill(process.processIdentifier, SIGKILL)
-                ConsoleTextLog.line("控制台未在 2 秒内退出，已强制结束（PID \(pid)）。")
+                self.log("控制台未在 2 秒内退出，已强制结束（PID \(pid)）。")
             }
             onChange?()
             return
         }
 
-        if PortProbe.isOpen(RuntimePaths.consolePort) {
-            ConsoleTextLog.line("8787 由外部进程监听；它不由本应用启动，应用不会终止它。")
+        if PortProbe.isOpen(port) {
+            log("\(port) 由外部进程监听；它不由本应用启动，应用不会终止它。")
         } else {
-            ConsoleTextLog.line("控制台已经停止。")
+            log("控制台已经停止。")
         }
         onChange?()
     }
@@ -559,10 +712,11 @@ final class ConsoleController {
         if let process, process.isRunning {
             wantsToRun = true
             restartAfterTermination = true
+            restartAttempt = 0
             restartWork?.cancel()
             restartWork = nil
             let pid = process.processIdentifier
-            ConsoleTextLog.line("重启控制台（PID \(pid)）。")
+            log("重启控制台（PID \(pid)）。")
             process.terminate()
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak process] in
                 if let process, process.isRunning {
@@ -572,8 +726,8 @@ final class ConsoleController {
             onChange?()
             return
         }
-        if PortProbe.isOpen(RuntimePaths.consolePort) {
-            ConsoleTextLog.line("8787 由外部进程监听，不能由本应用重启。")
+        if PortProbe.isOpen(port) {
+            log("\(port) 由外部进程监听，不能由本应用重启。")
             return
         }
         start(manual: true)
@@ -585,15 +739,209 @@ final class ConsoleController {
         restartAfterTermination = false
         restartWork?.cancel()
         restartWork = nil
+        stopWatchdog()
 
         if let process, process.isRunning {
-            ConsoleTextLog.line("菜单栏应用退出，停止受控控制台（PID \(process.processIdentifier)）。")
+            log("菜单栏应用退出，停止受控控制台（PID \(process.processIdentifier)）。")
             ProcessKiller.terminateAndWait(process)
         }
         try? outputHandle?.close()
         outputHandle = nil
         process = nil
         launchedAt = nil
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 看护自检（--watchdog-selftest）：8790 假实例，keep-alive / kill / 退避恢复
+// -----------------------------------------------------------------------------
+
+enum WatchdogSelfTest {
+    private static func httpOK(_ port: UInt16) -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        let semaphore = DispatchSemaphore(value: 0)
+        var ok = false
+        let task = URLSession.shared.dataTask(with: request) { _data, response, _error in
+            ok = (response as? HTTPURLResponse)?.statusCode == 200
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + 2.5) == .timedOut {
+            task.cancel()
+            return false
+        }
+        return ok
+    }
+
+    private static func pump(_ seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    private static func waitUntil(
+        _ timeout: TimeInterval,
+        _ condition: () -> Bool
+    ) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        return condition()
+    }
+
+    private static func writeFakeServer(_ url: URL) throws {
+        let script = #"""
+        #!/usr/bin/env python3
+        import http.server
+        import sys
+
+        port = 8790
+        if "--port" in sys.argv:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"ok\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        """#
+        try script.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    static func run() -> Int32 {
+        let env = ProcessInfo.processInfo.environment
+        let port = UInt16(env["COLLAB_SELFTEST_PORT"] ?? "") ?? 8790
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("collab-watchdog-selftest-\(getpid())", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: temp,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            print("WATCHDOG-SELFTEST FAIL: 无法创建临时目录 \(error)")
+            return 1
+        }
+        defer { try? FileManager.default.removeItem(at: temp) }
+
+        let fake = temp.appendingPathComponent("fake_console.py")
+        do {
+            try writeFakeServer(fake)
+        } catch {
+            print("WATCHDOG-SELFTEST FAIL: 无法写假实例 \(error)")
+            return 1
+        }
+
+        let controller = ConsoleController(
+            port: port,
+            consoleScript: fake,
+            consoleLogURL: temp.appendingPathComponent("console.log"),
+            projectRoot: temp,
+            watchdogInterval: 2.0,
+            startupGrace: 4.0
+        )
+        print("WATCHDOG-SELFTEST start port=\(port) temp=\(temp.path)")
+        controller.startWatchdog()
+        controller.start(manual: true)
+
+        guard waitUntil(8.0, { PortProbe.isOpen(port) && httpOK(port) }) else {
+            print("WATCHDOG-SELFTEST FAIL: 假实例未在 8 秒内启动并返回 200")
+            controller.shutdownSync()
+            return 1
+        }
+        guard let pid1 = controller.snapshot().ownedPID else {
+            print("WATCHDOG-SELFTEST FAIL: 没有受控 PID")
+            controller.shutdownSync()
+            return 1
+        }
+        print("WATCHDOG-SELFTEST first instance pid=\(pid1) up")
+
+        var failures: [String] = []
+        var lastRecovery = 0.0
+        for attempt in 1...2 {
+            guard let pid = controller.snapshot().ownedPID else {
+                failures.append("第 \(attempt) 次 kill 前没有受控 PID")
+                break
+            }
+            let killAt = Date()
+            kill(pid, SIGKILL)
+            _ = waitUntil(5.0, { !PortProbe.isOpen(port) })
+            let recovered = waitUntil(12.0, {
+                PortProbe.isOpen(port)
+                    && controller.snapshot().ownedPID != nil
+                    && httpOK(port)
+            })
+            let elapsed = Date().timeIntervalSince(killAt)
+            lastRecovery = elapsed
+            let count = controller.snapshot().restartCount
+            print(
+                "WATCHDOG-SELFTEST kill #\(attempt) pid=\(pid) recovered=\(recovered)"
+                + " http200=\(httpOK(port))"
+                + String(format: " elapsed=%.2fs restarts=%d", elapsed, count)
+            )
+            if !recovered {
+                failures.append("第 \(attempt) 次 kill 后 12 秒内未恢复")
+            } else if elapsed > 10.0 {
+                failures.append(String(format: "第 %d 次恢复 %.2fs > 10s", attempt, elapsed))
+            }
+            if count < attempt {
+                failures.append("第 \(attempt) 次恢复后 restartCount=\(count)")
+            }
+            _ = waitUntil(1.0, { false })
+        }
+
+        let beforeStop = controller.snapshot().restartCount
+        controller.stop()
+        guard waitUntil(5.0, { !PortProbe.isOpen(port) }) else {
+            failures.append("手动停止后端口仍开放")
+            controller.shutdownSync()
+            print("WATCHDOG-SELFTEST FAIL: \(failures.joined(separator: "；"))")
+            return 1
+        }
+        pump(4.0)
+        let afterStop = controller.snapshot()
+        if PortProbe.isOpen(port) {
+            failures.append("手动停止后 4 秒内端口被自动拉起")
+        }
+        if afterStop.restartCount != beforeStop {
+            failures.append("手动停止后 restartCount 从 \(beforeStop) 变为 \(afterStop.restartCount)")
+        }
+        print(
+            "WATCHDOG-SELFTEST manual-stop portOpen=\(PortProbe.isOpen(port))"
+            + " restarts=\(afterStop.restartCount)"
+        )
+
+        let logPath = temp.appendingPathComponent("console.log")
+        let logText = (try? String(contentsOf: logPath, encoding: .utf8)) ?? ""
+        let logLines = logText.split(separator: "\n").filter {
+            $0.contains("自动重启") || $0.contains("健康检查失败")
+                || $0.contains("将在") || $0.contains("看护已启动")
+        }
+        print("WATCHDOG-SELFTEST log:")
+        logLines.forEach { print("  \($0)") }
+        print(String(format: "WATCHDOG-SELFTEST lastRecovery=%.2fs", lastRecovery))
+
+        controller.shutdownSync()
+        if failures.isEmpty {
+            print("WATCHDOG-SELFTEST PASS")
+            return 0
+        }
+        print("WATCHDOG-SELFTEST FAIL: \(failures.joined(separator: "；"))")
+        return 1
     }
 }
 
@@ -946,6 +1294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildStatusItem()
         buildMenu()
         refreshUI()
+        consoleController.startWatchdog()
 
         refreshTimer = Timer.scheduledTimer(
             timeInterval: 2,
@@ -1125,22 +1474,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard consoleController != nil, guardController != nil else { return }
         let consoleSnapshot = consoleController.snapshot()
         let guardActive = guardController.enabled
+        let restartNote = consoleSnapshot.restartCount > 0
+            ? " · 已重启 \(consoleSnapshot.restartCount) 次"
+            : ""
 
         if consoleSnapshot.restarting {
-            consoleStatusItem.title = "控制台：◌ 重启中…"
+            consoleStatusItem.title = "控制台：◌ 重启中…\(restartNote)"
         } else if consoleSnapshot.ownedPID != nil {
-            consoleStatusItem.title = "控制台：● 运行中"
+            consoleStatusItem.title = "控制台：● 运行中\(restartNote)"
         } else if consoleSnapshot.portOpen {
-            consoleStatusItem.title = "控制台：● 运行中（外部）"
+            consoleStatusItem.title = "控制台：● 运行中（外部）\(restartNote)"
         } else {
-            consoleStatusItem.title = "控制台：○ 已停止"
+            consoleStatusItem.title = "控制台：○ 已停止\(restartNote)"
         }
 
         guardStatusItem.title = guardActive ? "守卫：● 常驻中" : "守卫：○ 已停止"
 
         startConsoleItem.isEnabled = !consoleSnapshot.running && !consoleSnapshot.restarting && !isTerminating
-        stopConsoleItem.isEnabled = consoleSnapshot.ownedPID != nil && !isTerminating
-        restartConsoleItem.isEnabled = consoleSnapshot.ownedPID != nil && !isTerminating
+        stopConsoleItem.isEnabled = (
+            consoleSnapshot.ownedPID != nil
+                || consoleSnapshot.restarting
+                || consoleSnapshot.wantsToRun
+        ) && !isTerminating
+        restartConsoleItem.isEnabled = (
+            consoleSnapshot.ownedPID != nil
+                || consoleSnapshot.restarting
+                || consoleSnapshot.wantsToRun
+        ) && !isTerminating
         openWebItem.isEnabled = !isTerminating
         startGuardItem.isEnabled = !guardActive && !isTerminating
         stopGuardItem.isEnabled = guardActive && !isTerminating
@@ -1179,8 +1539,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
         )
         statusItem.button?.attributedTitle = title
+        let lastRestart = consoleSnapshot.lastRestartAt.map {
+            "，最近 " + Clock.display($0)
+        } ?? ""
         statusItem.button?.toolTip = [
-            "控制台：" + (consoleSnapshot.ownedPID.map { "运行中，PID \($0)" } ?? (consoleSnapshot.portOpen ? "运行中（外部）" : "已停止")),
+            "控制台：" + (consoleSnapshot.ownedPID.map { "运行中，PID \($0)" } ?? (consoleSnapshot.portOpen ? "运行中（外部）" : "已停止"))
+                + (consoleSnapshot.restartCount > 0
+                    ? "，已重启 \(consoleSnapshot.restartCount) 次\(lastRestart)"
+                    : ""),
             "守卫：" + (guardActive ? "常驻中" : "已停止"),
         ].joined(separator: " · ")
     }
@@ -1249,6 +1615,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // -----------------------------------------------------------------------------
 // 入口
 // -----------------------------------------------------------------------------
+
+if CommandLine.arguments.contains("--watchdog-selftest") {
+    exit(WatchdogSelfTest.run())
+}
 
 let application = NSApplication.shared
 let delegate = AppDelegate()

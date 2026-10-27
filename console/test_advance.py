@@ -40,6 +40,9 @@ GLOBALS = (
     "RUNNER",
     "REGISTRATION_TIMEOUT_SECONDS",
     "PORT",
+    "ADVANCE_MAX_RUNTIME_SECONDS",
+    "ADVANCE_MAX_SUBTASKS",
+    "ADVANCE_MAX_REVISE_ROUNDS",
 )
 
 FAKE_AGENT = r'''#!/usr/bin/env python3
@@ -128,8 +131,13 @@ try:
         verdict = "须修正" if mode == "revise" else "通过"
         review_path = Path(review_match.group(1))
         done_path = Path(done_match.group(1))
+        attribution = re.search(
+            r"^- 审核角色：[^\n]*\n- 审查时间：[^\n]*", prompt, re.M
+        )
+        header = (attribution.group(0) + "\n\n") if attribution else ""
         body = (
-            "# 审查\n\n## 结论\n\n结论：**%s**\n\n"
+            header
+            + "# 审查\n\n## 结论\n\n结论：**%s**\n\n"
             "## 逐项证据\n\n- 已核对自动推进交付\n\n"
             "## 问题清单\n\n%s\n"
             % (
@@ -145,6 +153,8 @@ try:
 
     match = re.search(r"执行子任务 (T\d+-\d+)：", prompt)
     subtask = match.group(1) if match else "unknown"
+    attempt_match = re.search(r"attempt:\s*(\d+)", prompt)
+    attempt_line = ("attempt: %s\n" % attempt_match.group(1)) if attempt_match else ""
     record("dispatch start %s pid=%d cwd=%s" % (subtask, os.getpid(), os.getcwd()))
     time.sleep(sleep_seconds)
     outdir = Path.cwd() / "子任务" / subtask
@@ -154,7 +164,8 @@ try:
         "## 做了什么\n\n- 假 Agent 写交付记录\n\n"
         "## 怎么验\n\n- 核对 DONE.md 与产物\n\n"
         "## 结果\n\n- pid=%d cwd=%s\n"
-        % (subtask, os.getpid(), os.getcwd()),
+        "%s"
+        % (subtask, os.getpid(), os.getcwd(), attempt_line),
         encoding="utf-8",
     )
     (outdir / "result.txt").write_text(
@@ -403,6 +414,7 @@ class AdvanceTest(unittest.TestCase):
             if state and str(state.get("state") or "") in {
                 "completed",
                 "stopped",
+                "stopped_with_budget",
                 "failed",
             }:
                 if not server._active_advance_task():
@@ -623,6 +635,153 @@ class AdvanceTest(unittest.TestCase):
         lines = self.order_lines()
         self.assertFalse(any(line.startswith("overlap") for line in lines), lines)
         self.assertIn("review end " + task_id, "\n".join(lines))
+
+
+    def _wait_dispatch_started(self, task_id: str, timeout: float = 10.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if server._active_dispatch_task() == task_id:
+                return
+            time.sleep(0.03)
+        self.fail(f"{task_id} 分发没有在 {timeout} 秒内启动")
+
+    def test_advance_stop_terminates_current_agent_and_releases_lock(self) -> None:
+        self.make_task("T90", ["pending", "pending"])
+        os.environ["T14_AGENT_SLEEP"] = "6"
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T90", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        self._wait_dispatch_started("T90")
+        self.assertTrue(server.RUNNER.lock_path.exists())
+
+        status, page, _headers = self.request("GET", "/task/T90")
+        self.assertEqual(status, 200)
+        self.assertIn("停止推进", page)
+        self.assertIn('action="/advance/T90/stop"', page)
+
+        started = time.time()
+        status, body, _headers = self.request(
+            "POST", "/advance/T90/stop", accept="application/json", body=b""
+        )
+        elapsed = time.time() - started
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        final = payload["advance"]
+        self.assertEqual(final["state"], "stopped", final)
+        self.assertTrue(final.get("lock_released"), final)
+        self.assertLess(elapsed, 15, "停止请求不应长时间卡住")
+        self.assertFalse(server.RUNNER.lock_path.exists(), "停止后不得留下半锁")
+        self.assertEqual(server._active_advance_task(), "")
+
+        status, body, _headers = self.request(
+            "GET", "/api/task/T90/advance-status", accept="application/json"
+        )
+        self.assertEqual(status, 200)
+        live = json.loads(body)
+        self.assertEqual(live["state"], "stopped")
+        self.assertTrue(live["terminal"])
+        self.assertFalse(live["running"])
+        self.assertFalse(live["can_stop"])
+        self.assertIn("停止", live["message"])
+        self.assertFalse((self.projects / "T90_自动推进测试" / "对接" / "审查.md").exists())
+
+    def test_advance_stop_during_review_releases_lock(self) -> None:
+        self.make_task("T95", ["delivered"])
+        os.environ["T14_AGENT_SLEEP"] = "6"
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T95", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if server._active_review_task() == "T95":
+                break
+            time.sleep(0.03)
+        self.assertEqual(server._active_review_task(), "T95")
+        self.assertTrue(server.RUNNER.lock_path.exists())
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T95/stop", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 200, body)
+        final = json.loads(body)["advance"]
+        self.assertEqual(final["state"], "stopped", final)
+        self.assertTrue(final.get("lock_released"), final)
+        self.assertFalse(server.RUNNER.lock_path.exists())
+        self.assertEqual(server._active_advance_task(), "")
+
+    def test_advance_budget_subtasks_stops_before_dispatch(self) -> None:
+        server.ADVANCE_MAX_SUBTASKS = 1
+        project = self.make_task("T91", ["pending", "pending"])
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T91", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        final = self.wait_advance("T91")
+        self.assertEqual(final["state"], "stopped_with_budget", final)
+        self.assertIn("子任务预算", str(final.get("error") or ""))
+        self.assertFalse(server.RUNNER.lock_path.exists())
+        self.assertEqual(
+            [item.status for item in self.read_subtasks(project)],
+            ["pending", "pending"],
+        )
+        self.assertFalse((project / "对接" / "审查.md").exists())
+
+        status, page, _headers = self.request("GET", "/task/T91")
+        self.assertEqual(status, 200)
+        self.assertIn("预算用尽已停止", page)
+        self.assertIn("子任务预算", page)
+
+    def test_advance_budget_runtime_stops_and_releases_lock(self) -> None:
+        server.ADVANCE_MAX_RUNTIME_SECONDS = 0.4
+        os.environ["T14_AGENT_SLEEP"] = "4"
+        self.make_task("T92", ["pending"])
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T92", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        self._wait_dispatch_started("T92")
+        final = self.wait_advance("T92", timeout=20)
+        self.assertEqual(final["state"], "stopped_with_budget", final)
+        self.assertIn("运行时长", str(final.get("error") or ""))
+        self.assertFalse(server.RUNNER.lock_path.exists(), "超预算后不得留下半锁")
+        status, body, _headers = self.request(
+            "GET", "/api/task/T92/advance-status", accept="application/json"
+        )
+        live = json.loads(body)
+        self.assertEqual(live["state"], "stopped_with_budget")
+        self.assertTrue(live["stopped_with_budget"])
+        self.assertTrue(live["terminal"])
+        self.assertFalse(live["running"])
+
+    def test_advance_budget_revise_rounds_stops(self) -> None:
+        server.ADVANCE_MAX_REVISE_ROUNDS = 3
+        project = self.make_task("T93", ["pending"])
+        meta = project / "对接" / "task.yaml"
+        meta.write_text(
+            meta.read_text(encoding="utf-8").rstrip("\n")
+            + "\nrevise_round: 4\n",
+            encoding="utf-8",
+        )
+        self.start_server()
+
+        status, body, _headers = self.request(
+            "POST", "/advance/T93", accept="application/json", body=b""
+        )
+        self.assertEqual(status, 202, body)
+        final = self.wait_advance("T93")
+        self.assertEqual(final["state"], "stopped_with_budget", final)
+        self.assertIn("修订轮次", str(final.get("error") or ""))
+        self.assertFalse(server.RUNNER.lock_path.exists())
 
 
 if __name__ == "__main__":

@@ -24,6 +24,17 @@ sys.path.insert(0, str(APP_DIR))
 import runner  # noqa: E402
 import server  # noqa: E402
 
+LEGACY_REVIEW_TS = time.mktime((2026, 10, 26, 0, 0, 0, 0, 0, -1))
+
+
+def age_legacy_review(project: Path) -> None:
+    """预置审查视为 T24 之前的历史文件，继续按旧规则判定。"""
+    for name in ("审查.md", "审核完成.md"):
+        path = Path(project) / "对接" / name
+        if path.is_file():
+            os.utime(path, (LEGACY_REVIEW_TS, LEGACY_REVIEW_TS))
+
+
 GLOBALS = (
     "PROJECT_DIR",
     "COLLAB_DIR",
@@ -106,8 +117,13 @@ try:
                 issues = "- 缺少运行证据：DONE.md 没有记录命令输出"
         else:
             issues = "- 无"
+        attribution = re.search(
+            r"^- 审核角色：[^\n]*\n- 审查时间：[^\n]*", prompt, re.M
+        )
+        header = (attribution.group(0) + "\n\n") if attribution else ""
         body = (
-            "# 审查\n\n## 结论\n\n结论：**%s**\n\n"
+            header
+            + "# 审查\n\n## 结论\n\n结论：**%s**\n\n"
             "## 逐项证据\n\n- 已核对修正后的交付\n\n"
             "## 问题清单\n\n%s\n\n"
             "- 审核时刻：%.6f\n"
@@ -123,6 +139,8 @@ try:
 
     match = re.search(r"执行子任务 (T\d+-\d+)：", prompt)
     subtask = match.group(1) if match else "unknown"
+    attempt_match = re.search(r"attempt:\s*(\d+)", prompt)
+    attempt_line = ("attempt: %s\n" % attempt_match.group(1)) if attempt_match else ""
     record("dispatch start %s pid=%d cwd=%s" % (subtask, os.getpid(), os.getcwd()))
     time.sleep(sleep_seconds)
     if mode == "fail_dispatch" and subtask.endswith("-1"):
@@ -135,7 +153,8 @@ try:
         "# DONE %s\n\n"
         "## 做了什么\n\n- 假 Agent 执行修正\n\n"
         "## 怎么验\n\n- 检查产物\n\n"
-        "## 结果\n\n- pid=%d\n" % (subtask, os.getpid()),
+        "## 结果\n\n- pid=%d\n"
+        "%s" % (subtask, os.getpid(), attempt_line),
         encoding="utf-8",
     )
     (outdir / "result.txt").write_text(
@@ -376,6 +395,7 @@ class ReviseTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (docking / "审核完成.md").write_text("审核完成\n", encoding="utf-8")
+            age_legacy_review(project)
         return project
 
     def start_server(self) -> None:
@@ -423,6 +443,7 @@ class ReviseTest(unittest.TestCase):
             f"| P1 | 阻塞 | 产物不完整 | 重做 {rows} |\n"
         )
         (project / "对接" / "审查.md").write_text(body, encoding="utf-8")
+        age_legacy_review(project)
 
     def revise_meta(self, project: Path) -> dict:
         return server._read_task_meta(project, project.name.split("_", 1)[0])

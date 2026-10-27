@@ -121,3 +121,12 @@ python3 -m unittest discover -p 'test_*.py' -v
 ## License
 
 未指定（如需开源授权，请自行添加 LICENSE）。
+
+
+## 更新（2026-10-27）
+
+- **停止与预算**：自动推进可「停止推进」；默认上限 2 小时 / 12 个子任务 / 3 轮修订，超限 `stopped_with_budget`。
+- **审查署名**：新审查必须在头部声明 `审核角色：<role>（<agent id>）`；冒名 AI-A 会被拒收并隔离。
+- **控制台看护**：菜单栏控制器每 2 秒探活 8787，不可达按 1/2/4/8/16/30 秒退避重启；用户手动停止后不再拉起。
+- **全新克隆自检**：`bash scripts/check-fresh-clone.sh` 会在临时目录复制仓库、构建 App、检查 watch/ack/runner 三脚本与模块导入。
+- **交接闸门**：阶段推进前检查必要文件；缺失回叫上一步 Agent 补交，两次不齐转 `handoff_blocked`。
