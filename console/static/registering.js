@@ -43,7 +43,7 @@
     setText(logCode, payload.log || "尚未生成");
     if (failurePanel) {
       failurePanel.hidden = false;
-      failurePanel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      failurePanel.scrollIntoView({ block: "nearest", behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
     }
   }
 
@@ -51,7 +51,7 @@
     if (stopped) {
       return;
     }
-    timer = window.setTimeout(poll, delay);
+    timer = window.setTimeout(poll, document.hidden ? Math.max(delay, 8000) : delay);
   }
 
   function poll() {

@@ -28,7 +28,7 @@
     if (stopped) {
       return;
     }
-    timer = window.setTimeout(poll, delay);
+    timer = window.setTimeout(poll, document.hidden ? Math.max(delay, 8000) : delay);
   }
 
   function finish() {
@@ -49,6 +49,16 @@
         : (data.state_label || "全自动推进结束")
     );
     setText(note, data.message || data.error || "正在推进…");
+    setText(document.getElementById("advance-current"),
+      [data.current_subtask || data.step_label || "准备中", data.current_title || ""].filter(Boolean).join(" · "));
+    setText(document.getElementById("advance-counter"), (data.subtask_done || 0) + "/" + (data.subtask_total || 0) + " 已交付");
+    var progress = document.getElementById("advance-progress");
+    if (progress) { progress.max = Math.max(1, data.subtask_total || 0); progress.value = data.subtask_done || 0; }
+    if (data.stop_requested) {
+      var stopButton = document.getElementById("advance-stop");
+      if (stopButton) { stopButton.disabled = true; stopButton.textContent = "正在停止…"; }
+      setText(label, "正在停止 · 等待当前步骤清理");
+    }
     return !data.running;
   }
 

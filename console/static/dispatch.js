@@ -58,7 +58,7 @@
     if (stopped) {
       return;
     }
-    timer = window.setTimeout(poll, delay);
+    timer = window.setTimeout(poll, document.hidden ? Math.max(delay, 8000) : delay);
   }
 
   function finish() {

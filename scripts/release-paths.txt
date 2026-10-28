@@ -1,0 +1,53 @@
+# T25 release source whitelist: one repository-relative path per line.
+# check-fresh-clone.sh exports exactly these paths when the source tree has no .git.
+# Runtime data, task archives, local roles/agents, audit records and watcher state
+# are intentionally absent; keep this list in sync with the T25-1 inventory.
+.gitignore
+README.md
+console/README.md
+console/policy.py
+console/runner.py
+console/server.py
+console/static/advance.js
+console/static/confirm.js
+console/static/console.js
+console/static/dispatch.js
+console/static/new-task.js
+console/static/queue.js
+console/static/registering.js
+console/static/review.js
+console/static/revise.js
+console/static/style.css
+console/storage.py
+console/task_queue.py
+console/test_advance.py
+console/test_audit_p1.py
+console/test_dispatch.py
+console/test_handoff.py
+console/test_queue.py
+console/test_registration.py
+console/test_reliability.py
+console/test_review.py
+console/test_revise.py
+console/test_runner.py
+console/test_t20.py
+console/test_t23.py
+console/test_workspace.py
+console/workspace.py
+desktop/README.md
+desktop/Sources/main.swift
+desktop/build.sh
+desktop/runner.sh
+scripts/check-agent-cleanup.py
+scripts/check-fresh-clone.sh
+scripts/check-menu-navigation.py
+scripts/check-watchdog.sh
+scripts/release-paths.txt
+协作/README.md
+协作/settings.json
+协作/协作说明.md
+协作/调度台/ack.sh
+协作/调度台/rounds.sh
+协作/调度台/since.sh
+协作/调度台/state.py
+协作/调度台/watch.sh

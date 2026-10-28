@@ -1,21 +1,37 @@
-!协作/调度台/ack.sh
-!协作/调度台/watch.sh
-# 调度台只纳入运行脚本；锁、状态、日志、快照、令牌均为运行态，不入库
+# Generated files and local environments
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+node_modules/
+desktop/build/
 *.bak
 *.bak-*
 *.log
-*.pyc
-.DS_Store
-__pycache__/
-console/验收记录.md
-desktop/build/
-协作/调度台/*
-协作/调度台/guard.status
-协作/调度台/journal.log
-协作/调度台/menubar.control-token
-协作/调度台/runner.history.jsonl
-协作/调度台/runner.status
-协作/调度台/snapshots/
-协作/调度台/watch.state
-归档/
+.env
+.env.*
+!.env.example
+
+# Tasks, evidence, local routes and audit backups belong to this running instance.
 项目/
+归档/
+协作/审计/
+协作/roles/*.yaml
+协作/roles/.archive/
+协作/agents/*.yaml
+协作/agents/bin/
+协作/任务单/
+协作/交付/
+协作/审查/
+协作/研究规格/
+console/验收记录*.md
+
+# Keep watcher source; never commit locks, tokens, logs or snapshots.
+协作/调度台/*
+!协作/调度台/watch.sh
+!协作/调度台/ack.sh
+!协作/调度台/since.sh
+!协作/调度台/rounds.sh
+!协作/调度台/state.py

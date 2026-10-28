@@ -57,8 +57,16 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 try:  # 包导入（python3 -c "import console.server"）与脚本运行都可用
     from . import runner as runner_engine
+    from .storage import file_guard
+    from .policy import max_revise_rounds
+    from . import workspace as workspace_policy
+    from . import task_queue as queue_engine
 except ImportError:  # pragma: no cover - 直接运行 console/server.py 时走这里
     import runner as runner_engine
+    from storage import file_guard
+    from policy import max_revise_rounds
+    import workspace as workspace_policy
+    import task_queue as queue_engine
 
 # ---------------------------------------------------------------------------
 # 路径固定；命令行只覆盖测试端口与执行器超时，服务始终只绑定 127.0.0.1
@@ -97,12 +105,14 @@ GUARD_STATUS = DISPATCH_DIR / "guard.status"
 
 STYLE_FILE = APP_DIR / "static" / "style.css"
 CONFIRM_SCRIPT_FILE = APP_DIR / "static" / "confirm.js"
+CONSOLE_SCRIPT_FILE = APP_DIR / "static" / "console.js"
 NEW_TASK_SCRIPT_FILE = APP_DIR / "static" / "new-task.js"
 REGISTERING_SCRIPT_FILE = APP_DIR / "static" / "registering.js"
 DISPATCH_SCRIPT_FILE = APP_DIR / "static" / "dispatch.js"
 REVIEW_SCRIPT_FILE = APP_DIR / "static" / "review.js"
 ADVANCE_SCRIPT_FILE = APP_DIR / "static" / "advance.js"
 REVISE_SCRIPT_FILE = APP_DIR / "static" / "revise.js"
+QUEUE_SCRIPT_FILE = APP_DIR / "static" / "queue.js"
 
 HOST = "127.0.0.1"
 PORT = 8787
@@ -141,10 +151,12 @@ PICK_FOLDER_SCRIPT = (
 REGISTERING = "registering"
 REGISTERED = "registered"
 REGISTER_FAILED = "register_failed"
+QUEUED = "queued"
 REGISTER_STATUS_LABELS = {
     REGISTERING: "登记中",
     REGISTERED: "登记完成",
     REGISTER_FAILED: "登记失败",
+    QUEUED: "等待队列执行",
 }
 SUBTASK_STATUSES = ("pending", "running", "delivered", "passed", "failed")
 SUBTASK_STATUS_LABELS = {
@@ -268,11 +280,11 @@ ADVANCE_MAX_SUBTASKS = int(
     os.environ.get("COLLAB_ADVANCE_MAX_SUBTASKS", "12")
 )
 ADVANCE_MAX_REVISE_ROUNDS = int(
-    os.environ.get("COLLAB_ADVANCE_MAX_REVISE_ROUNDS", "3")
+    os.environ.get("COLLAB_ADVANCE_MAX_REVISE_ROUNDS", str(max_revise_rounds(PROJECT_DIR)))
 )
 
 # 继续修正（重修）：须修正 → 重置受影响子任务 → 自动分发 → 自动审核。
-MAX_REVISE_ROUNDS = 3
+MAX_REVISE_ROUNDS = max_revise_rounds(PROJECT_DIR)
 REVISE_MODE_AFFECTED = "affected"
 REVISE_MODE_ALL = "all"
 REVISE_MODE_REVIEW = "review"
@@ -300,6 +312,7 @@ STATUS_PASSED = "已通过/结案"
 STATUS_REVISE = "须修正"
 STATUS_DELIVERED = "已交付"
 STATUS_PENDING = "待处理"
+STATUS_RUNNING = "执行中"
 STATUS_NEEDS_ACTION = "需处理"
 
 STATUS_TONES = {
@@ -307,10 +320,12 @@ STATUS_TONES = {
     STATUS_REVISE: "revise",
     STATUS_DELIVERED: "delivered",
     STATUS_PENDING: "pending",
+    STATUS_RUNNING: "running",
     STATUS_NEEDS_ACTION: "revise",
 }
 STATUS_DISPLAY_ORDER = (
     (STATUS_PENDING, "pending"),
+    (STATUS_RUNNING, "running"),
     (STATUS_NEEDS_ACTION, "revise"),
     (STATUS_DELIVERED, "delivered"),
     (STATUS_REVISE, "revise"),
@@ -690,17 +705,19 @@ FORM_FIELDS = (
     "acceptance",
     "prohibitions",
     "workdir",
+    "work_mode",
     "owner_role",
     "idea",
     "auto_advance",
     "mode",
 )
-PUBLISH_FIELDS = ("title", "idea", "workdir", "auto_advance")
+PUBLISH_FIELDS = ("title", "idea", "workdir", "work_mode", "auto_advance")
 AUTO_ADVANCE_FIELD = "auto_advance"
 TASK_META_KEYS = (
     "id",
     "title",
     "workdir",
+    "work_mode",
     "created_at",
     "status",
     "controller",
@@ -741,12 +758,14 @@ DEFAULT_ROLE_SPECS = (
 )
 
 TASK_WRITE_LOCK = threading.Lock()
+PROCESS_START_LOCK = threading.RLock()
+SHUTTING_DOWN = threading.Event()
 PROJECT_MOVE_LOCK = threading.Lock()
 CONFIG_WRITE_LOCK = threading.Lock()
 TASK_LIFECYCLE_LOCKS: Dict[str, threading.RLock] = {}
 TASK_LIFECYCLE_LOCKS_GUARD = threading.Lock()
 TASK_LIFECYCLE_STATE = threading.local()
-REGISTRATION_START_LOCK = threading.Lock()
+REGISTRATION_START_LOCK = threading.RLock()
 ACTIVE_REGISTRATIONS: set[str] = set()
 DISPATCH_START_LOCK = threading.Lock()
 DISPATCH_STATE_LOCK = threading.RLock()
@@ -771,6 +790,8 @@ HANDOFF_POLL_INTERVAL_MS = 1500
 RUNNER_TIMEOUT_SECONDS = float(DEFAULT_RUN_TIMEOUT_SECONDS)
 REGISTRATION_TIMEOUT_SECONDS = float(DEFAULT_REGISTRATION_TIMEOUT_SECONDS)
 RUNNER: Optional[runner_engine.Runner] = None
+TASK_QUEUES: Dict[str, queue_engine.TaskQueue] = {}
+TASK_QUEUES_LOCK = threading.RLock()
 
 
 def _runner() -> runner_engine.Runner:
@@ -948,6 +969,7 @@ class Task:
     archived: bool = False
     revise_round: int = 0
     owner_role: str = DEFAULT_OWNER_ROLE
+    work_mode: str = workspace_policy.ISOLATED
 
     @property
     def docking_dir(self) -> Path:
@@ -1173,9 +1195,8 @@ def _normalize_task_meta(
     for key in TASK_META_KEYS:
         if key in meta:
             continue
-        meta[key] = text(
-            key, DEFAULT_OWNER_ROLE if key == "owner_role" else ""
-        )
+        fallback = DEFAULT_OWNER_ROLE if key == "owner_role" else (workspace_policy.ISOLATED if key == "work_mode" else "")
+        meta[key] = text(key, fallback)
     # 保留未知扩展字段，避免后续任何一次写回把外部集成字段清掉。
     for key, value in data.items():
         if key in meta or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", str(key)):
@@ -1271,10 +1292,18 @@ def _is_within(path: Path, directory: Path) -> bool:
         current = parent
 
 
-def _validate_workdir(raw: str, *, default: Path) -> Path:
+def _validate_workdir(raw: str, *, default: Path, work_mode: str = workspace_policy.ISOLATED) -> Path:
     """校验并规范化工作目录；不创建目录。默认值始终允许。"""
+    try:
+        work_mode = workspace_policy.mode(work_mode)
+    except ValueError as exc:
+        raise FormError(str(exc)) from exc
     value = raw.replace("\x00", "").strip()
     if not value:
+        if work_mode == workspace_policy.SELF:
+            return PROJECT_DIR.resolve()
+        if work_mode == workspace_policy.PROJECT:
+            raise FormError("修改项目源码时需要填写项目根目录；不能把任务档案目录当作源码目录。")
         return default.resolve()
     if len(value) > MAX_WORKDIR_CHARS:
         raise FormError(f"工作目录超过 {MAX_WORKDIR_CHARS} 字符，没有写入。")
@@ -1294,8 +1323,12 @@ def _validate_workdir(raw: str, *, default: Path) -> Path:
 
     if resolved == Path("/"):
         raise FormError("工作目录不能是文件系统根目录 /。")
-    if _same_path(resolved, root):
-        raise FormError("工作目录不能是值班台系统根本身；值班台不是 Agent 的工作区。")
+    try:
+        workspace_policy.validate_target(resolved, root, work_mode)
+    except ValueError as exc:
+        raise FormError(str(exc)) from exc
+    if work_mode == workspace_policy.SELF:
+        return root
     if _is_within(resolved, collab):
         raise FormError("工作目录不能位于 `协作/` 或其子目录；值班台的协作配置只读。")
     if _is_within(resolved, root):
@@ -1331,8 +1364,8 @@ def _validate_workdir(raw: str, *, default: Path) -> Path:
     return resolved
 
 
-def _ensure_workdir(raw: str, *, default: Path) -> Path:
-    workdir = _validate_workdir(raw, default=default)
+def _ensure_workdir(raw: str, *, default: Path, work_mode: str = workspace_policy.ISOLATED) -> Path:
+    workdir = _validate_workdir(raw, default=default, work_mode=work_mode)
     try:
         workdir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -1342,14 +1375,14 @@ def _ensure_workdir(raw: str, *, default: Path) -> Path:
     return workdir
 
 
-def _validate_project_folder(raw: str) -> Path:
+def _validate_project_folder(raw: str, work_mode: str = workspace_policy.ISOLATED) -> Path:
     """发布任务时选择的项目文件夹：必须是已存在的可用绝对目录。"""
     value = str(raw or "").replace("\x00", "").strip()
     if not value:
         raise FormError("请选择项目文件夹，或填写一个已存在的绝对路径。")
     if not value.startswith("/"):
         raise FormError("项目文件夹必须是绝对路径（以 / 开头）；相对路径会被拒绝。")
-    folder = _validate_workdir(value, default=PROJECTS_DIR)
+    folder = _validate_workdir(value, default=PROJECTS_DIR, work_mode=work_mode)
     if not folder.exists():
         raise FormError(f"项目文件夹不存在：{folder}。请先创建，或改选已有文件夹。")
     if not folder.is_dir():
@@ -1357,7 +1390,7 @@ def _validate_project_folder(raw: str) -> Path:
     return folder
 
 
-def _update_task_workdir(task: Task, raw: str) -> Path:
+def _update_task_workdir(task: Task, raw: str, work_mode: Optional[str] = None) -> Path:
     with _task_lifecycle_lock(task.task_id):
         latest = _find_task(task.task_id)
         if latest is None:
@@ -1403,16 +1436,31 @@ def _update_task_workdir(task: Task, raw: str) -> Path:
                 f"{task.task_id} 正在自动分发/审核，本次不修改工作目录。",
                 "等待推进结束后再修改。",
             )
-        workdir = _ensure_workdir(raw, default=task.workspace_dir)
+        lock = _runner().lock_info()
+        if lock.get("active") and str(lock.get("task") or "").upper() == task.task_id:
+            raise ActionError(409, "任务正在运行", "当前任务的执行器仍在运行，不能修改工作目录。")
+        try:
+            chosen_mode = workspace_policy.mode(task.work_mode if work_mode is None else work_mode)
+        except ValueError as exc:
+            raise FormError(str(exc)) from exc
+        if chosen_mode != task.work_mode and _work_mode_locked(task):
+            raise FormError("任务已有执行或交付记录，不能改变工作方式；请新建任务以保留原有交付路径。")
+        workdir = _ensure_workdir(raw, default=task.workspace_dir, work_mode=chosen_mode)
         meta = _ensure_task_meta(
             task.project_dir, task.task_id, task.title, title_mtime=task.mtime
         )
         meta["workdir"] = str(workdir)
+        meta["work_mode"] = chosen_mode
         try:
             _write_task_meta(task.meta_path, meta)
         except ConfigError as exc:
             raise FormError(f"无法写入 对接/{TASK_META_NAME}：{exc}") from exc
         return workdir
+
+
+def _work_mode_locked(task: Task) -> bool:
+    return (task.delivery is not None or task.review_path is not None or task.revise_round > 0
+            or any(item.status != "pending" or item.run_id or item.attempt for item in task.subtasks))
 
 
 def _update_task_owner_role(task: Task, raw: str) -> str:
@@ -1446,6 +1494,9 @@ def _update_task_owner_role(task: Task, raw: str) -> str:
                 f"{task.task_id} 正在分发/审核/推进/体检，本次没有修改 owner_role。",
                 "等待当前运行结束后再修改。",
             )
+        lock = _runner().lock_info()
+        if lock.get("active") and str(lock.get("task") or "").upper() == task.task_id:
+            raise ActionError(409, "任务正在运行", "当前任务的执行器仍在运行，不能修改负责人。")
         role_id = str(raw or "").replace("\x00", "").strip()
         if not role_id:
             raise FormError("owner_role 不能为空；请填写已存在角色（默认 designer）。")
@@ -1530,31 +1581,23 @@ def _fmt_size(size: int) -> str:
 
 
 def _collect_files(root: Path) -> List[FileEntry]:
-    """按相对路径列出目录内全部普通文件；缺失目录返回空列表。"""
-    if not root.is_dir():
-        return []
-    entries: List[FileEntry] = []
-    try:
-        candidates = list(root.rglob("*"))
-    except OSError:
-        return []
-    for path in candidates:
-        try:
-            if not path.is_file():
+    """Collect useful files lazily, avoiding dependency/cache trees and symlinks."""
+    entries = []
+    ignored = {".git", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
+    for directory, directories, names in os.walk(root):
+        directories[:] = [name for name in directories
+            if name not in ignored and not (Path(directory) / name).is_symlink()]
+        for name in names:
+            path = Path(directory) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                stat = path.stat()
+                entries.append(FileEntry(path=path, relative=path.relative_to(root).as_posix(),
+                    size=stat.st_size, mtime=stat.st_mtime))
+            except (OSError, ValueError):
                 continue
-            stat = path.stat()
-            entries.append(
-                FileEntry(
-                    path=path,
-                    relative=path.relative_to(root).as_posix(),
-                    size=stat.st_size,
-                    mtime=stat.st_mtime,
-                )
-            )
-        except (OSError, ValueError):
-            continue
-    entries.sort(key=lambda entry: entry.relative.casefold())
-    return entries
+    return sorted(entries, key=lambda entry: entry.relative.casefold())
 
 
 def _load_rounds() -> Dict[str, int]:
@@ -1691,6 +1734,7 @@ def _build_task(
         archived=archived,
         revise_round=_meta_int(meta.get("revise_round")),
         owner_role=str(meta.get("owner_role") or DEFAULT_OWNER_ROLE),
+        work_mode=str(meta.get("work_mode") or workspace_policy.ISOLATED),
     )
     task.status = _task_status_from_phase(task, _task_phase(task))
     return task
@@ -1760,13 +1804,29 @@ def _load_archived_tasks() -> List[Task]:
 
 
 def _find_task(task_id: str) -> Optional[Task]:
-    """详情页先找活动项目，再回落到 归档/ 中的只读档案。"""
-    for task in _load_tasks():
-        if task.task_id == task_id:
-            return task
-    for task in _load_archived_tasks():
-        if task.task_id == task_id:
-            return task
+    """Read only the requested task, preserving active-before-archive precedence."""
+    wanted = str(task_id).upper()
+    if not TASK_ID_RE.fullmatch(wanted):
+        return None
+    for root, archived in ((PROJECTS_DIR, False), (ARCHIVE_DIR, True)):
+        matches = []
+        try:
+            projects = list(root.iterdir())
+        except OSError:
+            continue
+        for project in projects:
+            match = PROJECT_NAME_RE.fullmatch(project.name)
+            if match is None or match.group(1).upper() != wanted:
+                continue
+            path = project / DOCKING_DIRNAME / TASK_SHEET_NAME
+            try:
+                if project.is_dir() and path.is_file():
+                    matches.append((path.stat().st_mtime, project.name, project, path))
+            except OSError:
+                continue
+        if matches:
+            mtime, name, project, path = max(matches)
+            return _build_task(project, name, wanted, path, mtime, _load_rounds(), archived=archived)
     return None
 
 
@@ -1802,6 +1862,9 @@ def _unique_project_target(parent: Path, project_name: str) -> Path:
 def _archive_project(task_id: str, project_name: str = "") -> Path:
     """把 项目/ 中的整个项目目录移动到 归档/；只移动，不删除。"""
     with _task_lifecycle_lock(task_id):
+        if any(item["id"] == task_id.upper() and item["status"] != "completed"
+               for item in _task_queue().snapshot()["items"]):
+            raise ActionError(409, "任务仍在执行队列", "请先从执行队列移出这张任务，再归档。")
         task = _latest_task(_load_tasks(), task_id, project_name)
         if task is None:
             raise ActionError(
@@ -1973,7 +2036,7 @@ def _create_task(fields: Dict[str, str]) -> str:
     created = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     slug = _slugify(title)
 
-    with TASK_WRITE_LOCK:
+    with TASK_WRITE_LOCK, file_guard(DISPATCH_DIR / ".locks" / "task-number.guard"):
         task_id = _next_task_id()
         project_name = f"{task_id}_{slug}"
         project_dir = PROJECTS_DIR / project_name
@@ -2041,7 +2104,9 @@ def _slug_from_idea(idea: str) -> str:
     return "待登记"
 
 
-def _create_published_task(fields: Dict[str, str]) -> Dict[str, object]:
+def _create_published_task(fields: Dict[str, str], *, deferred: bool = False) -> Dict[str, object]:
+    if not deferred and _queue_reserved():
+        raise FormError("执行队列正在运行。你可以通过队列的「批量布置」继续添加任务。")
     idea = str(fields.get("idea") or "")
     if "\x00" in idea:
         raise FormError("想法正文包含 NUL 字符，未写入任何文件。")
@@ -2056,7 +2121,11 @@ def _create_published_task(fields: Dict[str, str]) -> Dict[str, object]:
     if len(title) > MAX_TITLE_CHARS:
         raise FormError(f"任务标题超过 {MAX_TITLE_CHARS} 字，未写入任何文件。")
 
-    workdir = _validate_project_folder(str(fields.get("workdir") or ""))
+    try:
+        work_mode = workspace_policy.mode(fields.get("work_mode"))
+    except ValueError as exc:
+        raise FormError(str(exc)) from exc
+    workdir = _validate_project_folder(str(fields.get("workdir") or ""), work_mode)
     auto_advance = str(fields.get(AUTO_ADVANCE_FIELD) or "").strip().lower() in {
         "1",
         "on",
@@ -2068,26 +2137,27 @@ def _create_published_task(fields: Dict[str, str]) -> Dict[str, object]:
         raise FormError(resolution.note)
     controller = resolution.agent
 
-    active_advance = _active_advance_task()
-    if active_advance:
-        raise FormError(
-            f"{active_advance} 的全自动推进正在运行，本次没有创建项目；"
-            "请等待推进结束后再发布。"
-        )
-    lock = _runner().lock_info()
-    if ACTIVE_REGISTRATIONS or lock.get("active"):
-        current = str(lock.get("task") or "").strip()
-        raise FormError(
-            "执行器正忙"
-            + (f"（{current}）" if current else "")
-            + "，本次没有创建项目；请等待当前运行/登记结束后再发布。"
-        )
+    if not deferred:
+        active_advance = _active_advance_task()
+        if active_advance:
+            raise FormError(
+                f"{active_advance} 的全自动推进正在运行，本次没有创建项目；"
+                "请等待推进结束后再发布。"
+            )
+        lock = _runner().lock_info()
+        if ACTIVE_REGISTRATIONS or lock.get("active"):
+            current = str(lock.get("task") or "").strip()
+            raise FormError(
+                "执行器正忙"
+                + (f"（{current}）" if current else "")
+                + "，本次没有创建项目；请等待当前运行/登记结束后再发布。"
+            )
 
     idea_bytes = idea.encode("utf-8")
     idea_hash = hashlib.sha256(idea_bytes).hexdigest()
     created = _now_iso()
 
-    with TASK_WRITE_LOCK:
+    with TASK_WRITE_LOCK, file_guard(DISPATCH_DIR / ".locks" / "task-number.guard"):
         task_id = _next_task_id()
         slug = _slugify(title) if title else _slug_from_idea(idea)
         project_name = f"{task_id}_{slug}"
@@ -2117,11 +2187,12 @@ def _create_published_task(fields: Dict[str, str]) -> Dict[str, object]:
             "id": task_id,
             "title": title,
             "workdir": str(workdir),
+            "work_mode": work_mode,
             "created_at": created,
-            "status": REGISTERING,
+            "status": QUEUED if deferred else REGISTERING,
             "controller": controller.id,
             "idea_sha256": idea_hash,
-            "auto_advance": "1" if auto_advance else "",
+            "auto_advance": "1" if auto_advance and not deferred else "",
         }
         try:
             _write_task_meta(
@@ -2136,6 +2207,7 @@ def _create_published_task(fields: Dict[str, str]) -> Dict[str, object]:
         "project_name": project_name,
         "title": title,
         "workdir": workdir,
+        "work_mode": work_mode,
         "idea_sha256": idea_hash,
         "controller": controller,
         "resolution": resolution,
@@ -2150,6 +2222,7 @@ def _registration_prompt(
     project_dir: Path,
     workdir: Path,
     title_hint: str,
+    work_mode: str = workspace_policy.ISOLATED,
 ) -> str:
     docking = project_dir / DOCKING_DIRNAME
     title_instruction = (
@@ -2173,6 +2246,8 @@ def _registration_prompt(
 值班台根：{PROJECT_DIR}
 任务项目：{project_dir}
 人类项目文件夹（未来执行子任务的工作目录）：{workdir}
+工作方式：{workspace_policy.MODES.get(work_mode, work_mode)}
+{_workspace_instructions(work_mode, workdir)}
 
 先读（只读，严禁改写/覆盖/移动）：
 - 人类原文：{docking / IDEA_NAME}
@@ -2202,7 +2277,7 @@ def _registration_prompt(
    每个子任务必须写 agent_role，且必须是已存在角色（可用：{role_ids}）；
    缺角色或未知角色会让整次登记失败（register_failed）。
 3. 更新 {docking / TASK_META_NAME}
-   只把 status 改为 registered；保留 id、title、workdir、created_at 等既有字段。
+   只把 status 改为 registered；保留 id、title、workdir、work_mode、created_at 等既有字段。
    同时写入 owner_role: {owner_suggestion}（必须是已存在角色；仅无子任务整单重修时回叫它，
    人类之后可在任务详情编辑）。不要改 workdir。
    若 human 未指定标题，可同时把 title 补成你起的标题。
@@ -2211,7 +2286,7 @@ def _registration_prompt(
 
 禁止：
 - 不改写 idea.md，不删文件，不修改其它项目；
-- 不写 {docking / REVIEW_NAME}（审查由 AI-A 负责）；
+- 不写 {docking / REVIEW_NAME}（审查由 reviewer 角色负责）；
 - 不向 {PROJECT_DIR / "协作"} 写任何东西；
 - 不运行子任务、不安装依赖、不重启 8787；
 - 不把产物写到值班台外的项目文件夹；本次只写上面的 对接/ 文件。
@@ -2438,9 +2513,11 @@ def _start_registration(
     project_dir: Path,
     title_hint: str,
     controller: Optional[AgentApp] = None,
+    _queue_owned: bool = False,
 ) -> Dict[str, object]:
     """在同一把执行器锁下启动总控；立即返回，完成状态由回调写入 task.yaml。"""
     with REGISTRATION_START_LOCK:
+        _queue_check_start(task_id, owned=_queue_owned)
         if ACTIVE_REGISTRATIONS:
             raise FormError("已有登记正在运行，请等待完成后再重试。")
         if _active_dispatch_task():
@@ -2504,6 +2581,7 @@ def _start_registration(
             project_dir=project_dir,
             workdir=workdir,
             title_hint=title_hint,
+            work_mode=str(meta.get("work_mode") or workspace_policy.ISOLATED),
         )
 
         meta["status"] = REGISTERING
@@ -2561,14 +2639,18 @@ def _start_registration(
                     if should_auto_advance:
                         _schedule_auto_advance(task_id)
 
-            snapshot = _runner().launch_registration(
-                task_id=task_id,
-                task_dir=project_dir,
-                agent=spec,
-                prompt=prompt,
-                timeout_seconds=REGISTRATION_TIMEOUT_SECONDS,
-                on_finish=on_finish,
-            )
+            with PROCESS_START_LOCK:
+                _queue_check_start(task_id, owned=_queue_owned)
+                if SHUTTING_DOWN.is_set():
+                    raise FormError("控制台正在退出，请稍后重试。")
+                snapshot = _runner().launch_registration(
+                    task_id=task_id,
+                    task_dir=project_dir,
+                    agent=spec,
+                    prompt=prompt,
+                    timeout_seconds=REGISTRATION_TIMEOUT_SECONDS,
+                    on_finish=on_finish,
+                )
         except FormError as exc:
             with REGISTRATION_START_LOCK:
                 ACTIVE_REGISTRATIONS.discard(task_id)
@@ -2783,7 +2865,7 @@ def _registration_payload(task_id: str) -> Dict[str, object]:
         )
     meta = _read_task_meta(project_dir, task_id)
     status = str(meta.get("status") or "")
-    if status not in {REGISTERING, REGISTERED, REGISTER_FAILED}:
+    if status not in {REGISTERING, REGISTERED, REGISTER_FAILED, QUEUED}:
         status = REGISTER_FAILED
     subtasks, _error = _load_subtasks(
         project_dir / DOCKING_DIRNAME / SUBTASKS_NAME, task_id
@@ -3136,7 +3218,7 @@ def _task_sheet_prohibitions(task: Task) -> str:
 
 
 def _dispatch_revision_block(
-    context: Dict[str, object], subtask: Subtask
+    context: Dict[str, object], subtask: Subtask, source_mode: bool = False
 ) -> str:
     """修订上下文：父任务单/禁止事项、问题全文、审查快照与轮次、回归验收。"""
     round_no = str(context.get("round") or "?")
@@ -3168,9 +3250,39 @@ def _dispatch_revision_block(
         f"  · 重做后必须重新满足本子任务验收标准：{subtask.acceptance or '（未填写）'}",
         "  · 在 DONE.md 的「怎么验」写清本轮复跑命令与结果，并逐条对应上面的问题",
         "  · 不得回退上一轮已通过的其它子任务产物，不得缩小原有验收范围",
-        "  · 只写本子任务输出目录；发现问题无法在本子任务内解决时在 DONE.md 注明",
+        ("  · 只修改本子任务范围内的项目源码；交付记录只写本子任务交付目录，无法解决的问题在 DONE.md 注明"
+         if source_mode else "  · 只写本子任务输出目录；发现问题无法在本子任务内解决时在 DONE.md 注明"),
     ]
     return "\n".join(lines)
+
+
+def _workspace_instructions(work_mode: str, workdir: Path) -> str:
+    if not workspace_policy.source_mode(work_mode):
+        return "工作方式为独立产物：每个子任务只写约定输出目录。"
+    rules = (
+        f"项目源码根目录：{Path(workdir).resolve()}。所有执行角色共享此目录，按当前子任务范围修改现有代码、测试和文档。\n"
+        "代码留在原有位置；不要把整个仓库复制到子任务目录。完成说明和验证记录写入当前任务约定的交付目录。\n"
+        "只修改当前任务要求的范围；保留其他子任务已完成的修改，不重置或覆盖无关改动。\n"
+        "只有任务明确要求时才创建 Git 提交或推送；提交前检查暂存范围，不能夹带运行数据、任务档案、令牌或本机配置。\n"
+    )
+    if work_mode == workspace_policy.SELF:
+        rules += (
+            f"这是维护当前工作台源码的任务：允许修改 console/、desktop/、scripts/、文档与源码配置。\n"
+            f"保护运行数据：{PROJECT_DIR / '项目'}、{PROJECT_DIR / '归档'}、协作/roles/、协作/agents/ 下的本机登记、协作/审计/，以及协作/调度台/ 中除 watch.sh、ack.sh、since.sh、rounds.sh、state.py 外的状态/锁/日志/快照。\n"
+            "这些目录不能作为源码产物；任务档案仅按当前角色约定写自己的登记、交付和审查记录。\n"
+            "验收使用临时目录、假 Agent 和独立端口；不得重启或停止当前 8787 服务及菜单栏。完成后把需要重启的变更写入交付说明。\n"
+            "Agent 的实际文件访问仍由其 CLI 权限决定，上述目录是本任务的修改边界。\n"
+        )
+    return rules
+
+
+def _source_delivery_instructions(output: Path) -> str:
+    return (
+        f"\n项目交付清单（绝对路径）：{output / workspace_policy.MANIFEST}\n"
+        '清单必须为 JSON：{"files": ["相对项目根目录的现有源码路径"], "checks": ["实际运行的命令、结果与证据"]}。\n'
+        "files 仅列本次涉及的项目文件，不能包含运行数据、任务档案或越界路径；纯检查/提交/推送任务可为空，但 checks 必须记录实际操作与结果。\n"
+        "先完成代码和验证，再写 changes.json，最后写 DONE.md；DONE.md 不是源码文件的替代品。\n"
+    )
 
 
 def _dispatch_prompt(
@@ -3181,6 +3293,7 @@ def _dispatch_prompt(
     output_dir: Optional[Path] = None,
     revise_context: Optional[Dict[str, object]] = None,
     attempt: int = 0,
+    task: Optional[Task] = None,
 ) -> str:
     output = (
         Path(output_dir).resolve()
@@ -3195,9 +3308,22 @@ def _dispatch_prompt(
         f"输出目录（绝对路径）：{output}\n"
         f"完成后写 DONE.md（绝对路径）：{done_path}"
         f"（含：做了什么/怎么验/结果）\n"
-        "★ 所有产物与 DONE.md 只能写在上述输出目录内；不要再套一层 工作区/。\n"
-        "★ 不得写 对接/审查.md；不得改其它子任务；不删文件"
+        + (
+            "★ 代码直接修改在上述项目工作目录；输出目录只存交付记录。\n"
+            + _workspace_instructions(task.work_mode, workdir)
+            + _source_delivery_instructions(output)
+            if task is not None and workspace_policy.source_mode(task.work_mode)
+            else "★ 所有产物与 DONE.md 只能写在上述输出目录内；不要再套一层 工作区/。\n"
+        )
+        + "★ 不得写 对接/审查.md；不得改其它子任务的交付记录；不删文件"
     )
+    if task is not None:
+        prompt += (
+            f"\n父任务单（绝对路径，先读）：{task.path.resolve()}"
+            f"\n人类原文（如存在，只读）：{task.idea_path.resolve()}"
+            "\n父任务单的范围、禁止事项和验收标准同样适用于本子任务。"
+            f"\n父任务单「禁止事项」全文：\n{_task_sheet_prohibitions(task)}\n"
+        )
     if attempt > 0:
         prompt += (
             f"\n★ 本次分发记录：attempt: {attempt}。DONE.md 必须原样包含一行 "
@@ -3205,7 +3331,7 @@ def _dispatch_prompt(
             "也必须与本次运行一致。缺少或不匹配会被 G2 判为缺件。"
         )
     if revise_context:
-        prompt += _dispatch_revision_block(revise_context, subtask)
+        prompt += _dispatch_revision_block(revise_context, subtask, task is not None and workspace_policy.source_mode(task.work_mode))
     return prompt
 
 
@@ -3340,10 +3466,16 @@ def _dispatch_worker(
     bindings: Dict[str, Dict[str, object]],
     state: Dict[str, object],
     revise_context: Optional[Dict[str, object]] = None,
+    workflow: Optional[Dict[str, object]] = None,
 ) -> None:
     global ACTIVE_DISPATCH
     try:
         for index, subtask in enumerate(runs, start=1):
+            if workflow is not None:
+                abort, reason = _advance_abort_reason(workflow)
+                if abort:
+                    _dispatch_commit(state, state="failed", finished_at=_now_iso(), message=reason)
+                    return
             binding = bindings.get(subtask.id) or {}
             role = binding.get("role")
             agent = binding.get("agent")
@@ -3402,12 +3534,13 @@ def _dispatch_worker(
             output_dir = _subtask_output_dir(task, subtask)
             try:
                 runner = _runner()
-                launched = runner.launch(
+                launched = _launch_agent(workflow,
                     task_id=task.task_id,
                     task_dir=task.project_dir,
                     agent=spec,
                     round_no=1,
                     workdir=task.workdir,
+                    work_mode=task.work_mode,
                     prompt=_dispatch_prompt(
                         role,
                         subtask,
@@ -3415,6 +3548,7 @@ def _dispatch_worker(
                         output_dir=output_dir,
                         revise_context=revise_context,
                         attempt=attempt,
+                        task=task,
                     ),
                     kind="dispatch",
                     subtask_id=subtask.id,
@@ -3459,7 +3593,7 @@ def _dispatch_worker(
                 return
 
             finished = runner.wait_for_idle(runner.timeout_seconds + 120.0)
-            final = runner.snapshot()
+            final = runner.wait_for_result(str(launched["run_id"]), 0.0) or {"state": "failed", "error": "本次运行结果尚未完成收尾。"}
             if not finished:
                 result_state = "failed"
                 error = "等待子任务收尾超时；请检查执行器状态。"
@@ -3565,7 +3699,13 @@ def _start_dispatch(
 ) -> Dict[str, object]:
     """预检 pending/failed 子任务后启动分发线程；失败时不启动任何进程。"""
     global ACTIVE_DISPATCH
+    if revise_context is None:
+        resume = _revision_resume_state(task)
+        if resume:
+            revise_context = dict(resume.get("revise_context") or {})
     with DISPATCH_START_LOCK:
+        if not _advance_owned:
+            _queue_check_start(task.task_id)
         if _advance_owned and _advance_stop_requested():
             raise ActionError(
                 409,
@@ -3871,7 +4011,7 @@ def _start_dispatch(
             initial_state = copy.deepcopy(state)
             thread = threading.Thread(
                 target=_dispatch_worker,
-                args=(task, pending, bindings, state, revise_context),
+                args=(task, pending, bindings, state, revise_context, _workflow_for(task.task_id) if _advance_owned else None),
                 name=f"dispatch-{task.task_id}",
                 daemon=True,
             )
@@ -4063,13 +4203,14 @@ def _subtasks_all_delivered(task: Task) -> bool:
 
 
 def _workspace_product_entries(task: Task) -> List[FileEntry]:
-    """workdir 里除运行日志以外的产物；任务级审核允许没有 subtasks.yaml。
+    """收集交付记录或独立产物，排除运行日志；允许没有 subtasks.yaml。
 
-    默认 workdir 就是 工作区/，外部 workdir 则直接扫外部目录，保持与
-    子任务 output_dir 相同的路径口径。
+    源码模式只扫描任务工作区内的记录，避免把项目已有源码当作交付。
+    独立产物模式沿用 workdir，与子任务 output_dir 保持一致。
     """
     products: List[FileEntry] = []
-    for entry in _collect_files(task.workdir):
+    base = task.workspace_dir if workspace_policy.source_mode(task.work_mode) else task.workdir
+    for entry in _collect_files(base):
         relative = entry.relative.replace("\\", "/")
         if relative == "日志" or relative.startswith("日志/"):
             continue
@@ -4080,10 +4221,14 @@ def _workspace_product_entries(task: Task) -> List[FileEntry]:
 def _delivery_evidence(task: Task) -> Tuple[bool, str]:
     """任务级交付判据：DONE.md、全部子任务已交付或无子任务时的工作区产物。"""
     if task.delivery is not None:
+        if workspace_policy.source_mode(task.work_mode) and workspace_policy.manifest_problems(task.delivery.done_path.parent / workspace_policy.MANIFEST, task.workdir, PROJECT_DIR):
+            return False, "任务交付缺少有效的 changes.json 变更与验证清单"
         return True, f"对接/{task.delivery.folder}/DONE.md 已落盘"
     if _subtasks_all_delivered(task):
         return True, f"全部子任务已交付（{task.subtasks_done}/{len(task.subtasks)}）"
     if not task.subtasks:
+        if workspace_policy.source_mode(task.work_mode):
+            return False, "项目源码已有文件不能代替交付；请先完成任务并写入 DONE.md 与 changes.json"
         products = _workspace_product_entries(task)
         if products:
             return True, f"工作区已有 {len(products)} 个产物"
@@ -4264,17 +4409,24 @@ def _gate_g1(task: Task) -> Dict[str, object]:
 
 
 def _subtask_output_dir(task: Task, subtask: Subtask) -> Path:
-    """唯一交付目录：workdir/子任务/<id>（绝对路径）。
+    """返回各流程共用的子任务交付目录（绝对路径）。
 
-    默认 workdir 与外部 workdir 走同一条规则；提示词、G2、审核与日志
-    都引用这个结果，避免提示词多一层 `工作区/` 而 G2 查不到。
-    ID 再次做边界校验；resolve 后必须仍在 workdir 或项目工作区内。
+    源码模式使用任务工作区/交付/子任务/<id>，独立产物模式使用
+    workdir/子任务/<id>。统一校验 ID，并检查记录路径的边界与符号链接。
     """
     subtask_id = str(subtask.id or "")
     problem = _subtask_id_problem(subtask_id, task.task_id)
     if problem:
         raise ConfigError(f"子任务 id 不合法：{subtask_id or '（空）'}（{problem}）")
     workdir = Path(task.workdir).resolve()
+    if workspace_policy.source_mode(task.work_mode):
+        output = task.workspace_dir / "交付" / "子任务" / subtask_id
+        current = task.project_dir
+        for part in output.relative_to(task.project_dir).parts:
+            current = current / part
+            if current.is_symlink():
+                raise ConfigError("项目交付目录不能经过符号链接。")
+        return output.resolve()
     output = (workdir / "子任务" / subtask_id).resolve()
     allowed = (workdir, Path(task.workspace_dir).resolve())
     if not any(_is_within(output, root) for root in allowed):
@@ -4400,13 +4552,15 @@ def _gate_g2(task: Task) -> List[Dict[str, object]]:
                 )
             missing.extend(_done_freshness_problems(done_text, subtask))
         products = _subtask_products(output_dir)
-        if not products:
+        if workspace_policy.source_mode(task.work_mode):
+            missing.extend(workspace_policy.manifest_problems(output_dir / workspace_policy.MANIFEST, task.workdir, PROJECT_DIR))
+        elif not products:
             missing.append(
                 f"{_path_label(output_dir)}/ 至少 1 个产物文件（非 {DONE_NAME}）"
             )
         detail = ""
         if not missing:
-            detail = f"通过：{_path_label(done_path)} + {len(products)} 个产物"
+            detail = f"通过：{_path_label(done_path)} + " + ("项目变更与验证清单" if workspace_policy.source_mode(task.work_mode) else f"{len(products)} 个产物")
         checks.append(
             _handoff_gate_check(
                 "G2",
@@ -4597,6 +4751,11 @@ def _handoff_prompt(
                     f"  ★ 本次分发记录 attempt: {attempt}；补写的 {DONE_NAME} "
                     f"必须包含一行 `attempt: {attempt}`，否则 G2 仍判缺件。"
                 )
+            if subtask is not None and workspace_policy.source_mode(task.work_mode):
+                try:
+                    missing_lines.append(_source_delivery_instructions(_subtask_output_dir(task, subtask)))
+                except ConfigError:
+                    pass
     missing_text = "\n".join(missing_lines)
     missing_summary = "；".join(
         f"{check.get('key')} "
@@ -4648,8 +4807,9 @@ def _handoff_prompt(
         "- 只补上面列出的缺失文件；已有文件不得删除或重做。\n"
         f"- {DONE_NAME} 必须含「做了什么 / 怎么验 / 结果」三部分。\n"
         "- 子任务产物与 DONE.md 写入上面「可写入路径」列出的绝对路径"
-        "（统一为 <工作目录>/子任务/<子任务id>/）。\n"
-        f"- {review_rule}\n"
+        + ("（源码任务的交付记录位于本任务 工作区/交付/子任务/，源码仍在原项目目录）。\n" if workspace_policy.source_mode(task.work_mode) else "（统一为 <工作目录>/子任务/<子任务id>/）。\n")
+        + (_workspace_instructions(task.work_mode, task.workdir) + "只补交付清单时不要重新修改源码。\n" if workspace_policy.source_mode(task.work_mode) else "")
+        + f"- {review_rule}\n"
         "- 不删除文件，不改其它子任务，不重启 8787。\n"
         "补完即退出。"
     )
@@ -4671,12 +4831,13 @@ def _launch_handoff_agent(
     )
     safe_role = re.sub(r"[^A-Za-z0-9_-]+", "_", role_id)[:40] or "agent"
     runner = _runner()
-    runner.launch(
+    launched = _launch_agent(_workflow_for(task.task_id),
         task_id=task.task_id,
         task_dir=task.project_dir,
         agent=spec,
         round_no=max(1, task.revise_round),
         workdir=task.workdir,
+        work_mode=task.work_mode,
         prompt=prompt,
         kind="handoff",
         log_prefix=f"handoff-{safe_role}-{attempt}",
@@ -4694,7 +4855,7 @@ def _launch_handoff_agent(
             break
     if not finished:
         finished = runner.wait_for_idle(0.0)
-    snapshot = dict(runner.snapshot())
+    snapshot = runner.wait_for_result(str(launched["run_id"]), 0.0) or {"state": "failed", "error": "本次补交尚未完成收尾。"}
     return {
         "agent": agent.id,
         "agent_name": agent.name,
@@ -5252,11 +5413,8 @@ def _task_phase(task: Task) -> str:
     if str(advance_state.get("state") or "") == "handoff_blocked":
         return PHASE_HANDOFF_BLOCKED
     if _active_advance_task().upper() == task.task_id.upper():
-        revise_state = _advance_state_snapshot(task.task_id)
-        if revise_state.get("revise") and str(
-            revise_state.get("state") or ""
-        ) == "running":
-            step = str(revise_state.get("step") or "")
+        if str(advance_state.get("state") or "") == "running":
+            step = str(advance_state.get("step") or "")
             return PHASE_REVIEWING if step == "review" else PHASE_DISPATCHING
     if _active_review_task() == task.task_id or _review_active_for(task.task_id):
         return PHASE_REVIEWING
@@ -5283,6 +5441,8 @@ def _task_status_from_phase(task: Task, phase: str) -> str:
     """看板状态只由阶段派生，不再另用“交付 DONE.md 是否存在”一套判定。"""
     if phase == PHASE_PASSED:
         return STATUS_PASSED
+    if phase == PHASE_DISPATCHING:
+        return STATUS_RUNNING
     if phase == PHASE_REVISE:
         return STATUS_REVISE
     if phase == PHASE_HANDOFF_BLOCKED:
@@ -5360,7 +5520,12 @@ def _review_prompt(
         f"{delivery_lines}"
         f"{done_lines}\n"
         f"  - 工作目录/产物根（绝对路径）：{workdir}\n"
-        "· 按任务单的验收标准逐条核：功能、边界、证据\n"
+        + (
+            _workspace_instructions(task.work_mode, workdir)
+            + "源码审核：只读项目源码，并读取各 DONE.md 同目录的 changes.json，核对列出的源码和验证证据，不得把交付记录目录当成源码目录。\n"
+            if workspace_policy.source_mode(task.work_mode) else ""
+        )
+        + "· 按任务单的验收标准逐条核：功能、边界、证据\n"
         f"· 写 `对接/审查.md`（绝对路径：{review_path}）："
         "结论（**通过** 或 **须修正**）+ 逐项证据 + 问题清单\n"
         f"· 写 `对接/审核完成.md`（绝对路径：{review_done_path}）作为完成信号\n"
@@ -5528,6 +5693,7 @@ def _review_worker(
     role: Role,
     agent: AgentApp,
     state: Dict[str, object],
+    workflow: Optional[Dict[str, object]] = None,
 ) -> None:
     global ACTIVE_REVIEW
     try:
@@ -5539,12 +5705,13 @@ def _review_worker(
         )
         runner = _runner()
         try:
-            runner.launch(
+            launched = _launch_agent(workflow,
                 task_id=task.task_id,
                 task_dir=task.project_dir,
                 agent=spec,
                 round_no=1,
                 workdir=task.workdir,
+                work_mode=task.work_mode,
                 prompt=_review_prompt(task, role, agent),
                 kind="review",
                 log_prefix="review",
@@ -5561,7 +5728,7 @@ def _review_worker(
             return
 
         finished = runner.wait_for_idle(runner.timeout_seconds + 120.0)
-        final = runner.snapshot()
+        final = runner.wait_for_result(str(launched["run_id"]), 0.0) or {"state": "failed", "error": "本次审核尚未完成收尾。"}
         log = str(final.get("log") or "")
         run_state = str(final.get("state") or "failed")
         runner_error = str(final.get("error") or "")
@@ -5747,6 +5914,8 @@ def _start_review(
     """预检通过后启动审核线程；任何预检失败都不启动进程。"""
     global ACTIVE_REVIEW
     with REVIEW_START_LOCK:
+        if not _advance_owned:
+            _queue_check_start(task.task_id)
         if _advance_owned and _advance_stop_requested():
             raise ActionError(
                 409,
@@ -6044,7 +6213,7 @@ def _start_review(
             initial_state = copy.deepcopy(state)
             thread = threading.Thread(
                 target=_review_worker,
-                args=(task, role, agent, state),
+                args=(task, role, agent, state, _workflow_for(task.task_id) if _advance_owned else None),
                 name=f"review-{task.task_id}",
                 daemon=True,
             )
@@ -6346,6 +6515,26 @@ def _advance_abort_reason(
     return "", ""
 
 
+def _workflow_for(task_id: str) -> Optional[Dict[str, object]]:
+    with ADVANCE_STATE_LOCK:
+        if ACTIVE_ADVANCE is not None and str(ACTIVE_ADVANCE.get("task") or "").upper() == task_id.upper():
+            state = ACTIVE_ADVANCE.get("state")
+            return state if isinstance(state, dict) else None
+    return None
+
+
+def _launch_agent(workflow: Optional[Dict[str, object]] = None, **arguments) -> Dict[str, object]:
+    with PROCESS_START_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise runner_engine.RunnerError("控制台正在退出，不再启动任务。")
+        _queue_check_launch(str(arguments.get("task_id") or ""))
+        if workflow is not None:
+            abort, reason = _advance_abort_reason(workflow)
+            if abort:
+                raise runner_engine.RunnerError(reason)
+        return _runner().launch(**arguments)
+
+
 def _stop_active_runner_for_task(task_id: str, reason: str) -> bool:
     try:
         stopped = _runner().stop_active(reason, task_id=task_id)
@@ -6432,6 +6621,30 @@ def _advance_finish(
         )
 
 
+def _revision_resume_state(task: Task) -> Dict[str, object]:
+    """An interrupted revision resumes its existing round, context and artifacts."""
+    if task.archived or task.revise_round <= 0 or _active_advance_task().upper() == task.task_id.upper():
+        return {}
+    state = _read_advance_state_file(task.task_id)
+    if (not state.get("revise") or state.get("conclusion")
+            or int(state.get("revise_round") or 0) != task.revise_round
+            or task.revise_round <= 0
+            or str(state.get("state") or "") not in {"failed", "stopped", "stopped_with_budget", "running", "handoff_blocked"}):
+        return {}
+    context = state.get("revise_context")
+    if not isinstance(context, dict) or not context.get("review_snapshot"):
+        return {}
+    snapshot = Path(str(context["review_snapshot"]))
+    if not snapshot.is_absolute():
+        snapshot = PROJECT_DIR / snapshot
+    if not snapshot.is_file():
+        return {}
+    terminal, _ = _review_terminal_state(task)
+    if terminal and task.review_path is not None and _artifact_updated(task.review_path, _file_signature(snapshot)):
+        return {}  # A new complete review closes this revision, even after a crash.
+    return state
+
+
 def _advance_availability(task: Task) -> Tuple[bool, str]:
     if task.archived:
         return False, "归档任务只读，不能全自动推进。"
@@ -6440,7 +6653,7 @@ def _advance_availability(task: Task) -> Tuple[bool, str]:
     if _active_handoff_task():
         return False, "交接体检或自动补交正在进行，请等待结束。"
     terminal, terminal_verdict = _review_terminal_state(task)
-    if terminal:
+    if terminal and not _revision_resume_state(task):
         verdict = "须修正" if terminal_verdict == "revise" else "通过"
         return False, (
             f"任务已有审核结论（{verdict}；终态需 审查.md + 审核完成.md），"
@@ -6546,7 +6759,10 @@ def _wait_for_dispatch_finish(
                         "abort_reason": abort_reason,
                     }
                 )
-                return False, snapshot
+                if _active_dispatch_task().upper() != task_id.upper():
+                    return False, snapshot
+                time.sleep(0.05)
+                continue
         state = _dispatch_state_snapshot(task_id)
         snapshot = dict(state)
         if str(snapshot.get("state") or "") in {"completed", "failed"}:
@@ -6575,7 +6791,10 @@ def _wait_for_review_finish(
                         "abort_reason": abort_reason,
                     }
                 )
-                return False, snapshot
+                if _active_review_task().upper() != task_id.upper():
+                    return False, snapshot
+                time.sleep(0.05)
+                continue
         state = _review_state_snapshot(task_id)
         snapshot = dict(state)
         if str(snapshot.get("state") or "") in {"completed", "review_failed"}:
@@ -6738,12 +6957,13 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                 )
                 try:
                     runner = _runner()
-                    launched = runner.launch(
+                    launched = _launch_agent(advance_state,
                         task_id=task.task_id,
                         task_dir=task.project_dir,
                         agent=spec,
                         round_no=round_no,
                         workdir=task.workdir,
+                        work_mode=task.work_mode,
                         prompt=prompt,
                         kind="whole_rework",
                         log_prefix=log_prefix,
@@ -6754,7 +6974,7 @@ def _advance_worker(task_id: str, advance_state: Dict[str, object]) -> None:
                         advance_state,
                         runner.timeout_seconds + 120.0,
                     )
-                    final = dict(runner.snapshot())
+                    final = runner.wait_for_result(str(launched["run_id"]), 0.0) or {"state": "failed", "error": "整单重修尚未完成收尾。"}
                 except Exception as exc:
                     abort_state, abort_reason = _advance_abort_reason(
                         advance_state
@@ -7260,11 +7480,13 @@ def _start_advance(
     affected_ids: Optional[List[str]] = None,
     revise_log: str = "",
     revise_context: Optional[Dict[str, object]] = None,
+    _queue_owned: bool = False,
 ) -> Dict[str, object]:
     """预检后启动全自动推进线程；预检失败不会启动任何进程。"""
     global ACTIVE_ADVANCE
     with _task_lifecycle_lock(task.task_id):
         with ADVANCE_START_LOCK:
+            _queue_check_start(task.task_id, owned=_queue_owned)
             current = _find_task(task.task_id)
             if current is None:
                 raise ActionError(
@@ -7290,6 +7512,15 @@ def _start_advance(
                     "同一时刻只允许一个全自动推进。",
                     "等待当前推进结束后再试。",
                 )
+            resume = _revision_resume_state(task) if not revise else {}
+            if resume:
+                revise = True
+                whole_rework = bool(resume.get("whole_rework"))
+                revise_round = task.revise_round
+                strategy = str(resume.get("revise_strategy") or "")
+                affected_ids = list(resume.get("revise_targets") or [])
+                revise_log = str(resume.get("revise_log") or "")
+                revise_context = dict(resume.get("revise_context") or {})
             if not _prechecked:
                 if revise:
                     available, reason = _revise_availability(task)
@@ -7318,7 +7549,8 @@ def _start_advance(
                 "auto": bool(auto),
                 "revise": bool(revise),
                 "whole_rework": bool(whole_rework),
-                "whole_ran": False,
+                "whole_ran": bool(resume.get("whole_ran")),
+                "resumed": bool(resume),
                 "revise_round": effective_round,
                 "revise_strategy": strategy,
                 "revise_targets": list(affected_ids or []),
@@ -7355,7 +7587,8 @@ def _start_advance(
                 name=f"advance-{task.task_id}",
                 daemon=True,
             )
-            with ADVANCE_STATE_LOCK:
+            with PROCESS_START_LOCK, ADVANCE_STATE_LOCK:
+                _queue_check_start(task.task_id, owned=_queue_owned)
                 ACTIVE_ADVANCE = {"task": task.task_id, "state": state}
                 _write_advance_state_file(state)
             try:
@@ -7381,7 +7614,7 @@ def _stop_advance(task_id: str) -> Dict[str, object]:
     """用户显式停止全自动推进：终止当前 Agent，等待线程收尾并确认锁释放。"""
     global ACTIVE_ADVANCE
     task_id = task_id.strip().upper()
-    with ADVANCE_STATE_LOCK:
+    with PROCESS_START_LOCK, ADVANCE_STATE_LOCK:
         active = ACTIVE_ADVANCE
         if active is None or str(active.get("task") or "").upper() != task_id:
             raise ActionError(
@@ -7430,33 +7663,10 @@ def _stop_advance(task_id: str) -> Dict[str, object]:
 
     final = _advance_state_snapshot(task_id)
     if str(final.get("state") or "") == "running":
-        # 推进线程卡在不可中断的同步步骤：强制收口并阻止后续写入。
-        with ADVANCE_STATE_LOCK:
-            active = ACTIVE_ADVANCE
-            if active is not None and str(active.get("task") or "").upper() == task_id:
-                state = active.get("state")
-                if isinstance(state, dict):
-                    state.update(
-                        {
-                            "state": "stopped",
-                            "step": "done",
-                            "step_label": ADVANCE_STEP_LABELS["done"],
-                            "message": (
-                                "用户停止推进；推进线程未在 20 秒内退出，"
-                                "已强制收口并释放执行器锁。"
-                            ),
-                            "error": "",
-                            "conclusion": "",
-                            "finished_at": _now_iso(),
-                            "budget": _advance_budget_snapshot(state),
-                            "stop_requested": True,
-                        }
-                    )
-                    _write_advance_state_file(state)
-                    state["force_stopped"] = True
-                ACTIVE_ADVANCE = None
-        _stop_active_runner_for_task(task_id, reason)
-        final = _advance_state_snapshot(task_id)
+        # Never claim success or discard the cancellation token while workers live.
+        final = dict(final)
+        final["stopping"] = True
+        final["message"] = "正在停止，等待当前步骤完成清理；不会再启动后续任务。"
 
     _stop_active_runner_for_task(task_id, reason)
     try:
@@ -7513,6 +7723,7 @@ def _auto_advance_wait_and_start(task_id: str) -> None:
             return
         if (
             task_id in ACTIVE_REGISTRATIONS
+            or _queue_reserved()
             or _active_advance_task()
             or _active_dispatch_task()
             or _active_review_task()
@@ -7540,6 +7751,160 @@ def _auto_advance_wait_and_start(task_id: str) -> None:
     _record_auto_advance_failure(
         task_id, "发布后自动推进等待执行器空闲超时，未启动。"
     )
+
+
+def _task_queue() -> queue_engine.TaskQueue:
+    key = str(DISPATCH_DIR.resolve())
+    with TASK_QUEUES_LOCK:
+        if key not in TASK_QUEUES:
+            TASK_QUEUES[key] = queue_engine.TaskQueue(DISPATCH_DIR / "task-queue.status.json", _execute_queued_task)
+        return TASK_QUEUES[key]
+
+
+def _queue_reserved() -> bool:
+    return _task_queue().snapshot()["state"] in queue_engine.ACTIVE
+
+
+def _queue_check_start(task_id: str, *, owned: bool = False) -> None:
+    state = _task_queue().snapshot()
+    if state["state"] in queue_engine.ACTIVE:
+        current = next((item["id"] for item in state["items"] if item["status"] == "running"), "")
+        if not (owned and task_id and current == task_id.upper()):
+            raise ActionError(409, "执行队列正在运行", "任务正按队列顺序执行，请在队列暂停后再单独启动任务。")
+
+
+def _queue_check_launch(task_id: str) -> None:
+    state = _task_queue().snapshot()
+    if state["state"] in queue_engine.ACTIVE and not any(
+        item["id"] == task_id.upper() and item["status"] == "running" for item in state["items"]
+    ):
+        raise runner_engine.RunnerError("执行队列正在运行，不能插入其它任务。")
+
+
+def _execute_queued_task(task_id: str, progress: Callable) -> Dict[str, object]:
+    """Reuse the real registration and advance pipelines, including their gates/budgets."""
+    project = _find_registration_project(task_id)
+    if project is None:
+        return {"ok": False, "message": "任务不在活动项目中，请恢复任务或从队列移出。"}
+    meta = _read_task_meta(project, task_id)
+    if meta.get("status") != REGISTERED and (project / DOCKING_DIRNAME / IDEA_NAME).is_file():
+        progress("总控登记", "正在整理任务单并拆分子任务。")
+        _start_registration(task_id=task_id, project_dir=project, title_hint=str(meta.get("title") or ""), _queue_owned=True)
+        deadline = time.monotonic() + REGISTRATION_TIMEOUT_SECONDS + 30
+        while task_id in ACTIVE_REGISTRATIONS:
+            if SHUTTING_DOWN.is_set():
+                return {"ok": False, "message": "控制台已停止，确认任务状态后可继续。"}
+            if time.monotonic() > deadline:
+                _stop_active_runner_for_task(task_id, "队列等待登记超时")
+                return {"ok": False, "message": "总控登记未按时完成，请查看登记日志。"}
+            time.sleep(0.1)
+        meta = _read_task_meta(project, task_id)
+        if meta.get("status") != REGISTERED:
+            return {"ok": False, "message": str(meta.get("register_error") or "总控登记失败，请查看任务详情。")}
+    task = _find_task(task_id)
+    if task is None or task.archived:
+        return {"ok": False, "message": "任务单尚未生成或已被归档，请检查登记结果。"}
+    terminal, verdict = _review_terminal_state(task)
+    if terminal:
+        return {"ok": verdict == "passed", "message": "任务已审核通过。" if verdict == "passed" else "审核要求修正，请在任务详情完成修正后继续队列。"}
+    progress("准备执行", "正在检查交接文件与角色绑定。")
+    _start_advance(task, _queue_owned=True)
+    while _active_advance_task().upper() == task_id:
+        state = _advance_state_snapshot(task_id)
+        step = str(state.get("step") or "")
+        label = str(state.get("step_label") or "正在推进")
+        if step == "dispatch":
+            dispatch = _dispatch_state_snapshot(task_id)
+            current = str(dispatch.get("current_subtask") or "")
+            if current:
+                label = "执行 " + current
+        progress(label, str(state.get("message") or ""))
+        if SHUTTING_DOWN.is_set():
+            return {"ok": False, "message": "控制台已停止，确认任务状态后可继续。"}
+        time.sleep(0.15)
+    state = _advance_state_snapshot(task_id)
+    current = _find_task(task_id)
+    terminal, verdict = _review_terminal_state(current) if current else (False, "")
+    return {"ok": state.get("state") == "completed" and terminal and verdict == "passed",
+            "message": str(state.get("message") or "任务未完成，请查看详情。")}
+
+
+def _queue_candidates() -> List[dict]:
+    candidates = []
+    seen = set()
+    for task in reversed(_load_tasks()):
+        terminal, verdict = _review_terminal_state(task)
+        if terminal and verdict == "passed":
+            continue
+        seen.add(task.task_id)
+        candidates.append({"id": task.task_id, "title": task.title,
+                           "label": "须修正" if verdict == "revise" else _phase_label(_task_phase(task)),
+                           "url": "/task/" + task.task_id})
+    if PROJECTS_DIR.is_dir():
+        for project in PROJECTS_DIR.iterdir():
+            match = PROJECT_NAME_RE.fullmatch(project.name)
+            if not match or not project.is_dir() or project.is_symlink():
+                continue
+            task_id = match.group(1).upper()
+            if task_id in seen:
+                continue
+            meta = _read_task_meta(project, task_id)
+            if meta.get("status") in {QUEUED, REGISTER_FAILED}:
+                seen.add(task_id)
+                candidates.append({"id": task_id, "title": meta.get("title") or project.name.split("_", 1)[-1],
+                                   "label": REGISTER_STATUS_LABELS.get(meta.get("status"), "待登记"), "url": "/registering/" + task_id})
+    return sorted(candidates, key=lambda item: int(item["id"][1:]))
+
+
+def _queue_payload(*, candidates: bool = False) -> dict:
+    state = _task_queue().snapshot()
+    for item in state["items"]:
+        project = _find_registration_project(item["id"])
+        if project:
+            meta = _read_task_meta(project, item["id"])
+            item["title"] = meta.get("title") or item["title"]
+            item["url"] = ("/task/" if (project / DOCKING_DIRNAME / TASK_SHEET_NAME).is_file() else "/registering/") + item["id"]
+        else:
+            item["url"] = "/archive"
+    state.pop("batches", None)
+    state.update(ok=True, active=state["state"] in queue_engine.ACTIVE,
+                 pending=sum(item["status"] in {"pending", "blocked"} for item in state["items"]),
+                 completed=sum(item["status"] == "completed" for item in state["items"]))
+    if candidates:
+        existing = {item["id"] for item in state["items"]}
+        state["candidates"] = [item for item in _queue_candidates() if item["id"] not in existing]
+    return state
+
+
+def _create_queue_batch(fields: dict) -> dict:
+    try:
+        tasks = json.loads(fields.get("tasks") or "[]")
+    except (TypeError, ValueError) as exc:
+        raise FormError("批量任务格式无效。") from exc
+    if not isinstance(tasks, list) or not 1 <= len(tasks) <= 20:
+        raise FormError("每次可以布置 1–20 张任务。")
+    mode = str(fields.get("work_mode") or workspace_policy.PROJECT)
+    folder = _validate_project_folder(str(fields.get("workdir") or ""), mode)
+    request_id = str(fields.get("request_id") or "")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{16,80}", request_id):
+        raise FormError("布置请求标识无效，请刷新页面再试。")
+    normalized = []
+    for index, item in enumerate(tasks, 1):
+        if not isinstance(item, dict) or not isinstance(item.get("idea"), str) or not isinstance(item.get("title", ""), str):
+            raise FormError(f"第 {index} 张任务内容无效。")
+        idea = item["idea"]
+        title = " ".join(item.get("title", "").split())
+        if not idea.strip() or "\x00" in idea or len(idea) > MAX_IDEA_CHARS or "\x00" in title or len(title) > MAX_TITLE_CHARS:
+            raise FormError(f"请检查第 {index} 张任务的标题与内容，内容不能为空或超出长度限制。")
+        normalized.append({"title": title, "idea": idea, "workdir": str(folder), "work_mode": mode})
+    fingerprint = hashlib.sha256(json.dumps(normalized, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def create(index):
+        created = _create_published_task(normalized[index], deferred=True)
+        return queue_engine.TaskQueue.item(str(created["task_id"]), str(created["title"] or _slug_from_idea(normalized[index]["idea"])))
+
+    _task_queue().batch(len(normalized), request_id, fingerprint, create)
+    return _queue_payload()
 
 
 def _advance_status_payload(task: Task) -> Dict[str, object]:
@@ -7596,6 +7961,8 @@ def _advance_status_payload(task: Task) -> Dict[str, object]:
         ),
         "current_subtask": current_subtask,
         "current_title": current_title,
+        "subtask_done": task.subtasks_done,
+        "subtask_total": len(task.subtasks),
         "phase": phase,
         "phase_label": _phase_label(phase),
         "phase_tone": _phase_tone(phase),
@@ -7887,7 +8254,8 @@ def _whole_rework_prompt(
         f"进入{REVISE_MODE_LABELS[REVISE_MODE_WHOLE]}（第 {round_no} 轮）。\n"
         f"值班台项目目录：{task.project_dir}\n"
         f"工作目录（cwd）：{task.workdir}\n"
-        f"任务单（绝对路径）：{task.path}\n"
+        + (_workspace_instructions(task.work_mode, task.workdir) + _source_delivery_instructions(done_path.parent) if workspace_policy.source_mode(task.work_mode) else "")
+        + f"任务单（绝对路径）：{task.path}\n"
         f"上一轮审查快照（绝对路径）：{snapshot}\n"
         "\n"
         "=== 任务单全文（必须逐条满足） ===\n"
@@ -7904,13 +8272,17 @@ def _whole_rework_prompt(
         "  DONE.md 必须含「做了什么 / 怎么验 / 结果」三部分；"
         "「怎么验」写清本轮复跑命令与结果。\n"
         "- 不得回退上一轮已通过的内容，不得缩小原有验收范围。\n"
-        "- 只写工作目录内产物与上述 DONE.md；不得写 对接/审查.md；"
-        "不得删除文件、不改其它项目、不重启 8787。\n"
+        + ("- 修改项目源码；上述 DONE.md 和同目录的 changes.json 作为交付记录；不得写 对接/审查.md；"
+           if workspace_policy.source_mode(task.work_mode) else "- 只写工作目录内产物与上述 DONE.md；不得写 对接/审查.md；")
+        + "不得删除文件、不改其它项目、不重启 8787。\n"
         "完成后退出；系统会自动重新审核。"
     )
 
 
 def _revise_availability(task: Task) -> Tuple[bool, str]:
+    if _revision_resume_state(task):
+        available, reason = _advance_availability(task)
+        return available, (f"恢复第 {task.revise_round} 轮，保留修订上下文；不增加轮次。" if available else reason)
     if task.archived:
         return False, "归档任务只读，不能继续修正。"
     if _handoff_blocked_for(task.task_id):
@@ -7998,7 +8370,8 @@ def _revise_status_payload(task: Task) -> Dict[str, object]:
     if running:
         can_start = False
         reason = "继续修正正在进行，请等待当前步骤结束。"
-    at_limit = task.revise_round >= MAX_REVISE_ROUNDS
+    resumable = bool(_revision_resume_state(task))
+    at_limit = task.revise_round >= MAX_REVISE_ROUNDS and not resumable
     step = str(revise_state.get("step") or "")
     dispatch_state = _dispatch_state_snapshot(task.task_id)
     current_subtask = ""
@@ -8033,13 +8406,14 @@ def _revise_status_payload(task: Task) -> Dict[str, object]:
         "current_subtask": current_subtask,
         "current_title": current_title,
         "revise_round": task.revise_round,
-        "next_round": _revise_next_round(task),
+        "next_round": task.revise_round if resumable else _revise_next_round(task),
+        "resumable": resumable,
         "max_rounds": MAX_REVISE_ROUNDS,
         "at_limit": at_limit,
         "can_start": can_start,
         "disabled_reason": "" if can_start else reason,
         "ready_reason": reason if can_start else "",
-        "needs_choice": bool(task.subtasks) and not target_ids,
+        "needs_choice": bool(task.subtasks) and not target_ids and not resumable,
         "has_subtasks": bool(task.subtasks),
         "whole_rework": not bool(task.subtasks),
         "owner_role": task.owner_role,
@@ -8246,6 +8620,17 @@ def _start_revise(task: Task, mode: str = "") -> Dict[str, object]:
     对接/审查历史/round-<n>.md，回叫 owner_role 重做整单，再自动审核。
     """
     with REVISE_START_LOCK:
+        resume = _revision_resume_state(task)
+        if resume:
+            state = _start_advance(task)
+            return {
+                "ok": True, "task": task.task_id, "resumed": True,
+                "revise_round": task.revise_round, "max_rounds": MAX_REVISE_ROUNDS,
+                "mode": str(resume.get("revise_strategy") or "affected"),
+                "target_ids": list(resume.get("revise_targets") or []),
+                "reset_subtasks": [], "log": str(resume.get("revise_log") or ""),
+                "advance": state, "status_url": f"/api/task/{task.task_id}/revise-status",
+            }
         with _task_lifecycle_lock(task.task_id):
             current = _find_task(task.task_id)
             if current is None:
@@ -10176,6 +10561,13 @@ def _esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _work_mode_options(selected: str) -> str:
+    return "".join(
+        f'<option value="{key}"' + (' selected' if key == selected else '') + f'>{label}</option>'
+        for key, label in workspace_policy.MODES.items()
+    )
+
+
 def _tone(status: str) -> str:
     return STATUS_TONES[status]
 
@@ -10336,7 +10728,7 @@ def _render_dispatch_panel(task: Task, phase: str = PHASE_UNDISPATCHED) -> str:
           <div>
             <p class="aside-kicker">NEXT STEP / 分发实现</p>
             <h2 id="dispatch-panel-title">下一步：{'继续分发' if continuing else '开始分发实现'}</h2>
-            <p>{f'已交付 {delivered} 个；本次只处理待开始与失败的子任务，不会重跑已交付项。' if continuing else '不需要在本页选择 Agent：系统读取 <code>对接/subtasks.yaml</code> 的 <code>agent_role</code>，找到角色绑定的 Agent，按顺序逐个执行。'}</p>
+            <p>{f'已交付 {delivered} 个；本次只处理待开始与失败的子任务，不会重跑已交付项。' if continuing else '按子任务的角色配置依次执行。已交付的子任务会保留，失败项可以重试。'}</p>
           </div>
           <div class="dispatch-panel-state">
             {_phase_pill(phase)}
@@ -10413,7 +10805,7 @@ def _render_review_panel(task: Task, phase: str) -> str:
         dispatch_html = f"""
         <div class="notice {dispatch_tone} dispatch-summary review-dispatch-summary" role="status">
           <strong>{dispatch_heading}：成功 {dispatch_success} / 失败 {dispatch_failed}。</strong>
-          <span>{_esc(str(dispatch_state.get("message") or ""))}</span>
+          {f'<span>{_esc(str(dispatch_state.get("message") or ""))}</span>' if dispatch_state_name == 'failed' else ''}
         </div>
         """
     else:
@@ -10685,6 +11077,8 @@ def _render_advance_panel(task: Task, phase: str) -> str:
         <div class="dispatch-live" id="advance-live" role="status" aria-live="polite">
           <p class="dispatch-live-title"><span class="dispatch-pulse" aria-hidden="true"></span>
             <span id="advance-live-label">全自动推进中 · {_esc(step_label or "准备")}</span></p>
+          <p class="advance-current" id="advance-current">{_esc(str(payload.get('current_subtask') or step_label or '准备中'))} · {_esc(str(payload.get('current_title') or ''))}</p>
+          <div class="workflow-progress"><progress id="advance-progress" max="{max(1, len(task.subtasks))}" value="{task.subtasks_done}" aria-label="已交付子任务"></progress><span id="advance-counter">{task.subtasks_done}/{len(task.subtasks)} 已交付</span></div>
           <p class="dispatch-live-note" id="advance-live-message">{_esc(message or "正在推进…")}</p>
           {events_html}
           <p class="advance-time">开始 {_esc(started_at or "—")} · {_esc(budget_line)}</p>
@@ -10739,9 +11133,9 @@ def _render_advance_panel(task: Task, phase: str) -> str:
         {events_html}
         <p class="advance-time">{_esc(budget_line)}</p>
         <div class="advance-copy">
-          <p><strong>一条链跑到底：</strong>分发剩余 → 自动审核 → 停在「已通过 / 须修正」。</p>
-          <p>不会重跑 delivered/passed 子任务；失败项会重置为 pending 后重试一次。
-            任何 Agent 失败或审核未产出审查文件都会立即停止。</p>
+          <p><strong>执行流程：</strong>完成剩余子任务 → 审核 → 等待结论。</p>
+          <p>保留已交付和已通过的子任务；失败项会重试。
+            任一步失败时暂停，保留进度和日志。</p>
           {f'<p class="advance-reason">{_esc(reason)}</p>' if reason else ''}
         </div>
         """
@@ -10816,6 +11210,7 @@ def _render_revise_panel(task: Task, phase: str) -> str:
     whole_rework = bool(payload.get("whole_rework"))
     owner_role = str(payload.get("owner_role") or DEFAULT_OWNER_ROLE)
     at_limit = bool(payload.get("at_limit"))
+    resumable = bool(payload.get("resumable"))
     round_no = int(payload.get("revise_round") or 0)
     next_round = int(payload.get("next_round") or 1)
     max_rounds = int(payload.get("max_rounds") or MAX_REVISE_ROUNDS)
@@ -10914,6 +11309,9 @@ def _render_revise_panel(task: Task, phase: str) -> str:
         """
         action_html = f"""
         <div class="dispatch-action-row">
+          <form method="post" action="/advance/{_esc(task.task_id)}/stop" data-confirm="停止本轮修正？已交付项和本轮上下文会保留，之后可以恢复同一轮。">
+            <button class="button button--stop" id="advance-stop" type="submit">停止修正</button>
+          </form>
           <button class="button button--signal" id="revise-start" type="button" disabled>
             修正中…<span class="button-mark" aria-hidden="true">→</span>
           </button>
@@ -10921,6 +11319,7 @@ def _render_revise_panel(task: Task, phase: str) -> str:
             同一时刻只有一个 Agent 在运行。完成后页面自动刷新结论。</p>
         </div>
         """
+        live_html += action_html
         issue_html = ""
         target_html = ""
     else:
@@ -11066,6 +11465,12 @@ def _render_revise_panel(task: Task, phase: str) -> str:
             </div>
             <p class="dispatch-hint">{_esc(reason or ready_reason or '不会修改子任务产物。')}</p>
             """
+        if resumable:
+            title = f"恢复第 {round_no} 轮修正"
+            description = "上次执行已中断。保留本轮问题、历史快照与已交付项，继续完成修正和审核；不增加轮次。"
+            target_html = ""
+            last_result_html = f'<div class="notice notice--warn" role="status"><strong>本轮尚未完成。</strong><span>{_esc(error or message)}</span>{log_link}</div>'
+            action_html = f'<form class="dispatch-action" method="post" action="/revise/{_esc(task.task_id)}"><button class="button button--signal" id="revise-start" type="submit"{disabled_attr}>恢复本轮修正<span aria-hidden="true"> →</span></button></form><p class="dispatch-hint">{_esc(reason or ready_reason)}</p>'
         live_html = f"""
         {last_result_html}
         {limit_html}
@@ -11119,7 +11524,7 @@ def _handoff_probe_stage(task: Task, phase: str) -> Tuple[str, int]:
     return "dispatch", 0
 
 
-def _render_handoff_panel(task: Task, phase: str) -> str:
+def _render_handoff_panel_contents(task: Task, phase: str) -> str:
     """详情页交接闸门清单：✓/✗、责任方、缺件与重试入口。"""
     state = _handoff_state_snapshot(task.task_id)
     state_name = str(state.get("state") or "")
@@ -11267,15 +11672,91 @@ def _render_handoff_panel(task: Task, phase: str) -> str:
     """
 
 
+def _render_handoff_panel(task: Task, phase: str) -> str:
+    markup = _fold_workflow_notes(_render_handoff_panel_contents(task, phase))
+    if markup and 'handoff-check is-fail' not in markup and _active_handoff_task() != task.task_id:
+        return ('<details class="handoff-summary"><summary>✓ 交接文件检查通过'
+                '<span>查看检查项与日志</span></summary>' + markup + '</details>')
+    return markup
+
+
+def _fold_workflow_notes(markup: str) -> str:
+    return re.sub(r'<p class="dispatch-panel-foot">(.*?)</p>',
+        r'<details class="technical-note"><summary>运行规则与日志位置</summary><div>\1</div></details>',
+        markup, flags=re.DOTALL)
+
+
 def _render_workflow_panel(task: Task, phase: str) -> str:
     if task.archived:
         return ""
-    if _revise_active_for(task.task_id) or phase == PHASE_REVISE:
-        return _render_revise_panel(task, phase)
-    advance_panel = _render_advance_panel(task, phase)
-    if phase in {PHASE_REVIEW_READY, PHASE_REVIEWING, PHASE_PASSED}:
-        return advance_panel + _render_review_panel(task, phase)
-    return advance_panel + _render_dispatch_panel(task, phase)
+    current = {PHASE_UNDISPATCHED: 1, PHASE_DISPATCHING: 1,
+        PHASE_REVIEW_READY: 2, PHASE_REVIEWING: 2, PHASE_PASSED: 3}.get(phase, 1)
+    steps = "".join(
+        f'<li class="{("is-complete" if index < current else "is-current" if index == current else "")}"'
+        + (' aria-current="step"' if index == current else '')
+        + f'><span>{("✓" if index < current else str(index + 1))}</span>{label}</li>'
+        for index, label in enumerate(("登记", "执行", "审核", "完成")))
+    journey = f'<ol class="workflow-path" aria-label="任务进度">{steps}</ol>'
+    if _revise_active_for(task.task_id) or phase == PHASE_REVISE or _revision_resume_state(task):
+        body = _render_revise_panel(task, phase)
+    else:
+        manual = (_render_review_panel(task, phase) if phase in {PHASE_REVIEW_READY, PHASE_REVIEWING, PHASE_PASSED}
+            else _render_dispatch_panel(task, phase))
+        if phase == PHASE_PASSED:
+            body = manual
+        elif _active_advance_task() == task.task_id:
+            body = _render_advance_panel(task, phase)
+        elif _active_dispatch_task() == task.task_id or _review_active_for(task.task_id):
+            body = manual
+        else:
+            body = _render_advance_panel(task, phase) + (
+                '<details class="manual-steps" data-persist="manual-steps">'
+                '<summary>手动分步<span>只执行当前阶段，完成后由你决定下一步</span></summary>'
+                + manual + '</details>')
+    return f'<div id="workflow" data-task-url="/task/{_esc(task.task_id)}">{journey}{_fold_workflow_notes(body)}</div>'
+
+
+def _render_queue_drawer() -> str:
+    return f"""
+  <dialog class="queue-drawer" id="queue-drawer" aria-labelledby="queue-heading" data-self-root="{_esc(PROJECT_DIR)}">
+    <header class="queue-head">
+      <div><p class="queue-eyebrow">EXECUTION / 按序协作</p><h2 id="queue-heading">执行队列<span id="queue-total">00</span></h2></div>
+      <button class="queue-close" type="button" data-queue-close aria-label="关闭执行队列">×</button>
+    </header>
+    <div class="queue-tabs" role="tablist" aria-label="执行队列">
+      <button id="queue-tab-order" type="button" role="tab" aria-selected="true" aria-controls="queue-order" data-queue-tab="order">任务顺序</button>
+      <button id="queue-tab-add" type="button" role="tab" aria-selected="false" aria-controls="queue-add" tabindex="-1" data-queue-tab="add">从看板添加</button>
+      <button id="queue-tab-batch" type="button" role="tab" aria-selected="false" aria-controls="queue-batch" tabindex="-1" data-queue-tab="batch">批量布置</button>
+    </div>
+    <p class="queue-feedback" id="queue-feedback" role="status" aria-live="polite" hidden></p>
+    <section class="queue-panel" id="queue-order" role="tabpanel" aria-labelledby="queue-tab-order">
+      <div class="queue-scroll">
+        <div class="queue-overview"><span id="queue-state-label">准备就绪</span><span id="queue-progress-text">还没有待处理任务</span></div>
+        <div class="queue-progress-track" aria-hidden="true"><i id="queue-progress-fill"></i></div>
+        <p class="queue-policy" id="queue-policy">每张任务审核通过后，才会执行下一张。遇到失败或须修正时暂停。</p>
+        <div id="queue-current"></div>
+        <div class="queue-list-heading"><h3>接下来</h3><span id="queue-waiting-count">0 张待处理</span></div>
+        <ol class="queue-list" id="queue-list"></ol>
+        <div class="queue-empty" id="queue-empty" hidden><span aria-hidden="true">↳</span><h3>先把下一步安排好</h3><p>添加已有任务，或一次写下多张任务。排好顺序后，再统一开始。</p><button class="button button--primary" type="button" data-queue-compose>批量布置任务 ＋</button><button class="text-link" type="button" data-queue-choose>选择已有任务</button></div>
+        <details class="queue-finished" id="queue-finished" hidden><summary id="queue-finished-label">已完成</summary><ol id="queue-completed"></ol><button class="text-link" type="button" id="queue-clear">清理已完成记录</button></details>
+      </div>
+      <footer class="queue-footer"><p id="queue-footer-hint">顺序自动保存，关闭面板后仍可继续执行。</p><div><button class="button button--ghost" type="button" data-queue-choose>添加任务 ＋</button><button class="button button--primary" type="button" id="queue-start" disabled>开始执行 →</button><button class="button button--ghost" type="button" id="queue-pause" hidden>当前任务完成后暂停</button></div></footer>
+    </section>
+    <section class="queue-panel" id="queue-add" role="tabpanel" aria-labelledby="queue-tab-add" hidden>
+      <div class="queue-scroll"><p class="queue-panel-intro">选择要执行的任务，加入后可以调整先后顺序。</p><label class="queue-search-label" for="queue-search">搜索任务<input class="field-input" type="search" id="queue-search" placeholder="编号或任务名称" autocomplete="off"></label><div id="queue-candidates"></div></div>
+      <footer class="queue-footer"><p id="queue-selection-count">尚未选择任务</p><button class="button button--primary" type="button" id="queue-add-selected" disabled>加入队列 →</button></footer>
+    </section>
+    <section class="queue-panel" id="queue-batch" role="tabpanel" aria-labelledby="queue-tab-batch" hidden>
+      <form id="queue-batch-form" class="queue-batch-form">
+        <div class="queue-scroll"><p class="queue-panel-intro">一次布置多张任务，共用同一个项目文件夹。保存后先排队，点击开始再逐张登记和执行。</p>
+          <div class="queue-project-settings"><label for="queue-work-mode">工作方式</label><select class="field-input" id="queue-work-mode" name="work_mode">{_work_mode_options(workspace_policy.PROJECT)}</select><label for="queue-workdir">项目文件夹</label><div class="queue-folder"><input class="field-input" id="queue-workdir" name="workdir" placeholder="填写项目文件夹绝对路径" required autocomplete="off" spellcheck="false"><button class="button button--ghost" id="queue-pick-folder" type="button" aria-label="选择批量任务的项目文件夹">选择…</button></div><p id="queue-folder-hint">所有任务会按顺序维护这份项目源码。</p></div>
+          <div id="queue-drafts"></div><button class="queue-add-draft" id="queue-add-draft" type="button">＋ 再安排一张任务</button><p class="queue-draft-note" id="queue-draft-note">草稿保存在当前浏览器，最多 20 张。</p>
+        </div>
+        <footer class="queue-footer"><p>仅保存并排队，暂不调用 Agent。</p><button class="button button--primary" type="submit" id="queue-save-batch">保存到队列 →</button></footer>
+      </form>
+    </section>
+  </dialog>
+    """
 
 
 def _render_page(title: str, active: str, content: str) -> str:
@@ -11323,12 +11804,15 @@ def _render_page(title: str, active: str, content: str) -> str:
       <p class="rail-label">工作区 / WORKSPACE</p>
       <nav class="rail-nav" aria-label="主导航">
         {''.join(nav_html)}
+        <button class="nav-link queue-nav" type="button" data-queue-open>
+          <span class="nav-code">QUEUE</span><span>执行队列</span><span class="queue-nav-count" data-queue-count>0</span>
+        </button>
       </nav>
       <div class="rail-foot">
         <p class="rail-local"><span class="local-dot" aria-hidden="true"></span>本机运行</p>
         <p class="rail-address">{HOST}:{PORT}</p>
         <p class="rail-note">执行器单实例 · 运行记录<br>任务单 / 归档 / 角色与 Agent</p>
-        <p class="rail-roles">AI-A 审查 <span>/</span> AI-B 执行 <span>/</span> HUMAN 决策</p>
+        <p class="rail-roles">总控登记 <span>/</span> Agent 执行 <span>/</span> 审核复核</p>
       </div>
     </aside>
     <main id="main" class="main">
@@ -11341,13 +11825,16 @@ def _render_page(title: str, active: str, content: str) -> str:
       </div>
     </main>
   </div>
+  {_render_queue_drawer()}
   <script src="/static/confirm.js" defer></script>
+  <script src="/static/console.js" defer></script>
   <script src="/static/new-task.js" defer></script>
   <script src="/static/registering.js" defer></script>
   <script src="/static/dispatch.js" defer></script>
   <script src="/static/review.js" defer></script>
   <script src="/static/advance.js" defer></script>
   <script src="/static/revise.js" defer></script>
+  <script src="/static/queue.js" defer></script>
 </body>
 </html>
 """
@@ -11383,6 +11870,8 @@ def _render_dashboard(tasks: List[Task]) -> str:
 
     tally = []
     for status, tone in STATUS_DISPLAY_ORDER:
+        if status == STATUS_PENDING:
+            continue
         tally.append(
             f"""
             <div class="status-index-item">
@@ -11409,7 +11898,7 @@ def _render_dashboard(tasks: List[Task]) -> str:
             )
             rows.append(
                 f"""
-                <li class="task-item" data-status="{tone}" data-phase="{_esc(phase)}">
+                <li class="task-item" data-status="{tone}" data-phase="{_esc(phase)}" data-search="{_esc(task.task_id + ' ' + task.title)}">
                   <a class="task-row" href="/task/{_esc(task.task_id)}">
                     <span class="task-id">
                       <span class="task-id-code">{_esc(task.task_id)}</span>
@@ -11424,7 +11913,7 @@ def _render_dashboard(tasks: List[Task]) -> str:
                     <span class="task-state">
                       {_stamp(task.status)}
                       {phase_html}
-                      <span class="task-rounds">轮次 {task.rounds:02d}</span>
+                      <span class="task-rounds">修正 {max(task.rounds, task.revise_round):02d} 轮</span>
                       {subtask_html}
                     </span>
                     <span class="task-enter" aria-hidden="true">↗</span>
@@ -11441,9 +11930,15 @@ def _render_dashboard(tasks: List[Task]) -> str:
             <h2 class="section-title" id="register-title">任务登记簿</h2>
             <span class="section-meta">按编号倒序 · {total:02d} 张</span>
           </div>
+          <div class="task-filters" id="task-filters" hidden>
+            <label class="task-search">搜索任务<input class="field-input" id="task-search" type="search" placeholder="编号或任务名称" autocomplete="off"></label>
+            <label>状态<select class="field-input" id="task-filter"><option value="all">全部状态</option><option value="attention">需要处理</option><option value="running">正在执行</option><option value="review_ready">待审核</option><option value="passed">已通过</option></select></label>
+            <span id="task-filter-count" role="status" aria-live="polite">共 {total} 个任务</span>
+          </div>
           <ol class="task-register">
             {''.join(rows)}
           </ol>
+          <p class="filter-empty" id="filter-empty" hidden>没有匹配的任务。调整搜索词或状态筛选即可。</p>
         </section>
         """
     else:
@@ -11452,7 +11947,7 @@ def _render_dashboard(tasks: List[Task]) -> str:
           <p class="empty-kicker">REGISTER EMPTY</p>
           <h2 id="empty-title">登记簿还是空的</h2>
           <p>写下第一张任务单，协作流程就从这里开始。</p>
-          <a class="button button--primary" href="/new">新建第一张任务单</a>
+          <a class="button button--primary" href="/new">发布第一个任务</a>
         </section>
         """
 
@@ -11464,18 +11959,17 @@ def _render_dashboard(tasks: List[Task]) -> str:
           <p class="lede">每张任务单都在独立项目目录内，沿 <code>对接/</code> 查看交付与审查，沿 <code>工作区/</code> 查看实际产物。归档只会整体移动到 <code>归档/</code>，不删除任何文件。</p>
         </div>
         <div class="head-actions">
-          <a class="button button--ghost" href="/roles">角色</a>
-          <a class="button button--ghost" href="/archive">归档库</a>
+          <button class="button button--ghost" type="button" data-queue-open>执行队列 <span class="queue-count" data-queue-count>0</span></button>
           <a class="button button--primary" href="/new">
-            新建任务单<span class="button-mark" aria-hidden="true">＋</span>
+            发布任务<span class="button-mark" aria-hidden="true">＋</span>
           </a>
         </div>
       </header>
 
       <section class="summary-panel" aria-label="任务概况">
         <div class="summary-total">
-          <span class="summary-kicker">REGISTERED / 登记总数</span>
-          <strong class="summary-number">{total:02d}</strong>
+          <span class="summary-kicker">待处理数</span>
+          <strong class="summary-number">{counts[STATUS_PENDING]:02d}</strong>
           <span class="summary-unit">张任务单</span>
         </div>
         <dl class="status-index">
@@ -11483,6 +11977,11 @@ def _render_dashboard(tasks: List[Task]) -> str:
         </dl>
       </section>
 
+      <button class="queue-strip" type="button" data-queue-open aria-label="查看执行队列与任务顺序">
+        <span class="queue-strip-icon" aria-hidden="true">↳</span>
+        <span class="queue-strip-copy"><strong data-queue-summary>把任务排好，一次开始。</strong><small data-queue-preview>批量布置 · 按序执行 · 审核通过后继续下一张</small></span>
+        <span class="queue-strip-action">安排顺序 <span aria-hidden="true">→</span></span>
+      </button>
       {tasks_html}
     """
     return _render_page("任务看板", "board", content)
@@ -11512,7 +12011,7 @@ def _render_archive_page() -> str:
                     </span>
                     <span class="task-state">
                       {_stamp(task.status)}
-                      <span class="task-rounds">轮次 {task.rounds:02d}</span>
+                      <span class="task-rounds">修正 {max(task.rounds, task.revise_round):02d} 轮</span>
                     </span>
                     <span class="task-enter" aria-hidden="true">↗</span>
                   </a>
@@ -12004,11 +12503,11 @@ def _render_task_detail(
         head_actions = (
             f'<a class="button button--ghost" href="/">返回看板</a>'
             f'<a class="button button--ghost" href="/runs">运行记录</a>'
-            f"{_archive_form(task)}"
+            f'<details class="task-more"><summary>更多操作</summary>{_archive_form(task)}</details>'
         )
         side_note = (
             "档案内容只读。分发只启动执行器与 Agent；控制台本身不写对接/交付/ 与审查.md。"
-            "执行器以工作目录为 cwd；值班台只读，运行日志仍写在 项目/工作区/日志/。"
+            "执行器以所选项目目录为 cwd；交付记录与运行日志保存在本任务工作区。源码任务可在约定范围内修改原项目。"
             "归档只把整个项目目录移入 归档/，不改写任何档案文件。"
         )
 
@@ -12057,7 +12556,7 @@ def _render_task_detail(
             "doc-delivery",
             "04",
             "最新交付",
-            "对接/交付/ 中还没有 DONE.md。任务会停留在「待处理」，直到执行方交付。",
+            "没有任务级交付汇总；当前交付进度以子任务清单和工作目录产物为准。",
         )
 
     if task.review_path and task.review_mtime is not None:
@@ -12077,29 +12576,37 @@ def _render_task_detail(
             "对接/审查.md 还没有出现。状态暂由交付情况决定。",
         )
 
-    workdir_tag = "已归档 · 只读" if task.archived else "可编辑"
+    task_running = (phase in {PHASE_DISPATCHING, PHASE_REVIEWING}
+        or _active_handoff_task() == task.task_id or _active_advance_task() == task.task_id)
+    edit_disabled = " disabled" if task_running else ""
+    mode_disabled = " disabled" if task_running or _work_mode_locked(task) else ""
+    roles, _role_issues = _load_roles()
+    role_choices = "".join(
+        f'<option value="{_esc(role.id)}"' + (' selected' if role.id == task.owner_role else '')
+        + f'>{_esc(role.name)}（{_esc(role.id)}）</option>' for role in roles)
+    if not any(role.id == task.owner_role for role in roles):
+        role_choices = f'<option value="{_esc(task.owner_role)}" selected>{_esc(task.owner_role)}（未登记）</option>' + role_choices
+    workdir_tag = "已归档 · 只读" if task.archived else ("运行中 · 暂不可编辑" if task_running else "可编辑")
     workdir_tag_class = "" if task.archived else " meta-tag--edit"
     workdir_editor = (
         ""
         if task.archived
         else f"""
-            <form class="workdir-form" method="post" action="/task/{_esc(task.task_id)}/workdir">
+            <form class="workdir-form" method="post" action="/task/{_esc(task.task_id)}/workdir" data-self-root="{_esc(str(PROJECT_DIR))}">
+              <label class="aside-kicker" for="task-work-mode">工作方式</label>
+              <select class="field-input" name="work_mode" id="task-work-mode"{mode_disabled}>{_work_mode_options(task.work_mode)}</select>
               <label class="aside-kicker" for="workdir-input">工作目录（可编辑）</label>
               <input class="field-input" id="workdir-input" name="workdir" type="text"
                 maxlength="{MAX_WORKDIR_CHARS}" value="{_esc(str(task.workdir))}"
-                autocomplete="off" spellcheck="false">
-              <p class="workdir-hint">绝对路径；留空 = 本任务默认工作区。值班台内只允许
-                <code>项目/&lt;编号&gt;/工作区/</code>。</p>
-              <button class="button button--ghost button--small" type="submit">保存工作目录</button>
+                autocomplete="off" spellcheck="false"{edit_disabled}>
+              <p class="workdir-hint">修改项目源码时，所有执行 Agent 共用项目目录；交付记录留在本任务档案。维护本系统请选择“维护工作台自身”。已有执行记录后不能切换工作方式。</p>
+              <button class="button button--ghost button--small" type="submit"{edit_disabled}>保存工作目录</button>
             </form>
             <form class="workdir-form" method="post" action="/task/{_esc(task.task_id)}/owner-role">
-              <label class="aside-kicker" for="owner-role-input">owner_role（整单重修）</label>
-              <input class="field-input" id="owner-role-input" name="owner_role" type="text"
-                maxlength="48" value="{_esc(task.owner_role)}"
-                autocomplete="off" spellcheck="false">
-              <p class="workdir-hint">无子任务任务在「须修正」时回叫该角色绑定的 Agent；
-                默认 <code>designer</code>，必须是已存在角色。</p>
-              <button class="button button--ghost button--small" type="submit">保存 owner_role</button>
+              <label class="aside-kicker" for="owner-role-input">整单重修负责人</label>
+              <select class="field-input" id="owner-role-input" name="owner_role"{edit_disabled}>{role_choices}</select>
+              <p class="workdir-hint">没有子任务时，由这个角色执行整单修正。运行期间暂不能修改。</p>
+              <button class="button button--ghost button--small" type="submit"{edit_disabled}>保存负责人</button>
             </form>
         """
     )
@@ -12114,8 +12621,10 @@ def _render_task_detail(
         kind_for=lambda entry: _docking_file_kind(task, entry),
         preview=True,
     )
-    workspace_title = "工作区文件（值班台侧）" if task.uses_custom_workdir else "工作区文件"
+    workspace_title = "交付记录与日志" if workspace_policy.source_mode(task.work_mode) else ("工作区文件（值班台侧）" if task.uses_custom_workdir else "工作区文件")
     workspace_empty = (
+        "源码保留在选定项目目录；本任务的完成说明、验证记录和日志会显示在这里。"
+        if workspace_policy.source_mode(task.work_mode) else
         "值班台工作区还是空的；本任务的产物在外部工作目录里，不在此列出。"
         if task.uses_custom_workdir
         else "工作区还是空的；这里会列出执行方产出的代码、文档或数据文件。"
@@ -12215,10 +12724,6 @@ def _render_task_detail(
               </div>
               <div class="meta-row">
                 <dt>修正轮次</dt>
-                <dd class="meta-code">{task.rounds} 轮</dd>
-              </div>
-              <div class="meta-row">
-                <dt>继续修正</dt>
                 <dd class="meta-code">{task.revise_round}/{MAX_REVISE_ROUNDS} 轮</dd>
               </div>
               <div class="meta-row">
@@ -12272,7 +12777,7 @@ def _render_task_detail(
 
 
 def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -> str:
-    fields = {"title": "", "idea": "", "workdir": "", "auto_advance": "1"}
+    fields = {"title": "", "idea": "", "workdir": "", "work_mode": workspace_policy.PROJECT, "auto_advance": "1"}
     if values:
         for name in fields:
             fields[name] = str(values.get(name) or "")
@@ -12330,6 +12835,7 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
             并自动调用总控登记任务、拆出可独立运行的子任务。</p>
         </div>
         <div class="head-actions">
+          <button class="button button--ghost" type="button" data-queue-compose>批量布置任务 ＋</button>
           <a class="button button--ghost" href="/">返回看板</a>
         </div>
       </header>
@@ -12338,17 +12844,21 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
 
       <div class="publish-layout">
         <form class="publish-form" id="publish-form" method="post" action="/publish"
-          data-validate-url="/api/validate-folder">
+          data-validate-url="/api/validate-folder" data-self-root="{_esc(str(PROJECT_DIR))}">
           <section class="intake-block" aria-labelledby="folder-step-title">
             <div class="intake-index" aria-hidden="true">01</div>
             <div class="intake-body">
               <div class="intake-heading">
                 <div>
                   <h2 id="folder-step-title">项目文件夹</h2>
-                  <p>Agent 未来在这个文件夹里工作；发布时只登记，不写入它。</p>
+                  <p>所有执行 Agent 围绕同一份项目工作；任务单、日志和交付记录单独保存。</p>
                 </div>
                 <span class="required-mark">必填</span>
               </div>
+              <label class="workspace-mode-label" for="field-work-mode">这个任务怎样工作</label>
+              <select class="field-input workspace-mode" id="field-work-mode" name="work_mode"
+                aria-describedby="work-mode-help">{_work_mode_options(fields['work_mode'])}</select>
+              <p class="intake-hint work-mode-help" id="work-mode-help" role="status"></p>
               <div class="folder-picker">
                 <button class="button button--ghost folder-button" id="folder-pick" type="button">
                   选择项目文件夹…<span class="button-mark" aria-hidden="true">⌘</span>
@@ -12362,8 +12872,8 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
               </div>
               <p class="folder-status is-idle" id="folder-status" role="status"
                 aria-live="polite">{_esc(initial_status)}</p>
-              <p class="intake-hint">必须是已存在的绝对路径；不能是系统根，也不能位于
-                <code>协作/</code> 下。原生选择框不可用时，直接手动输入同样生效。</p>
+              <p class="intake-hint">选择已存在的项目根目录；原生选择框不可用时可直接填写绝对路径。
+                要修改当前工作台，在上方切换工作方式即可自动使用本系统目录。</p>
             </div>
           </section>
 
@@ -12382,7 +12892,7 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
                 placeholder="例如：&#10;我想做一个能自动整理每日收货单据的小工具……&#10;&#10;现在的问题、想要的结果、必须遵守的限制，都可以直接写在这里。">{_esc(fields['idea'])}</textarea>
               <div class="idea-foot">
                 <span>原文会保存为 <code>对接/idea.md</code>，总控只读，不改写。</span>
-                <span>支持长文粘贴</span>
+                <span id="idea-count">0 / {MAX_IDEA_CHARS} 字</span>
               </div>
             </div>
           </section>
@@ -12404,6 +12914,7 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
             </div>
           </section>
 
+          <div class="draft-status"><span id="draft-status" role="status">草稿仅保存在本机浏览器</span><button class="text-link" type="button" id="draft-clear">清除草稿</button></div>
           <div class="publish-bar">
             {controller_panel}
             <div class="publish-action">
@@ -12426,7 +12937,7 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
         <aside class="write-note intake-note" aria-label="发布说明">
           <div class="write-note-inner">
             <p class="aside-kicker">PUBLISH FLOW / 发布之后</p>
-            <h2>登记，但不执行</h2>
+            <h2>由你选择何时开始执行</h2>
             <ol class="flow-list">
               <li><span>01</span>分配最小空号，创建 <code>项目/TNN_slug/对接/</code></li>
               <li><span>02</span>保存 <code>idea.md</code> 与 <code>task.yaml</code></li>
@@ -12435,8 +12946,8 @@ def _render_new_page(values: Optional[Dict[str, str]] = None, error: str = "") -
             </ol>
             <dl class="scope-list">
               <div><dt>总控写入</dt><dd>任务单.md · subtasks.yaml · 登记完成.md</dd></div>
-              <div><dt>本期</dt><dd>只登记和拆解；子任务执行后续再接 runner</dd></div>
-              <div><dt>只读</dt><dd>协作/ · 对接/审查.md</dd></div>
+              <div><dt>执行方式</dt><dd>勾选自动推进：登记后执行并审核；取消勾选：登记后等待你启动</dd></div>
+              <div><dt>任务资料</dt><dd>人类原文保留，交付记录与源码分开</dd></div>
               <div><dt>项目文件夹</dt><dd>必须是已存在的绝对目录</dd></div>
             </dl>
             <div class="aside-note">
@@ -12488,7 +12999,14 @@ def _render_registering_page(task_id: str) -> str:
         else ""
     )
 
-    if status == REGISTERED:
+    if status == QUEUED:
+        status_panel = f"""
+          <div class="register-visual is-waiting" aria-hidden="true"><span>↳</span></div>
+          <h1>已安排，等待执行</h1>
+          <p class="register-lede">{_esc(title or '任务想法已保存。')} · 轮到这张任务时，总控会先登记再执行。</p>
+          <p><button class="button button--primary" type="button" data-queue-open>查看队列顺序 →</button></p>
+        """
+    elif status == REGISTERED:
         status_panel = f"""
           <div class="register-visual is-success" aria-hidden="true"><span>✓</span></div>
           <h1>登记完成</h1>
@@ -13591,8 +14109,9 @@ def _agents_api_payload() -> dict:
     }
 
 
-def _task_revise_api(task: Task) -> Dict[str, object]:
-    phase = _task_phase(task)
+def _task_revise_api(task: Task, *, phase: Optional[str] = None) -> Dict[str, object]:
+    phase = phase or _task_phase(task)
+    resumable = bool(_revision_resume_state(task))
     can_start = False
     reason = "当前阶段不是「须修正」，无需继续修正。"
     if phase == PHASE_REVISE:
@@ -13602,7 +14121,8 @@ def _task_revise_api(task: Task) -> Dict[str, object]:
     return {
         "revise_round": task.revise_round,
         "revise_max_rounds": MAX_REVISE_ROUNDS,
-        "revise_next_round": _revise_next_round(task),
+        "revise_next_round": task.revise_round if resumable else _revise_next_round(task),
+        "revise_resumable": resumable,
         "revise_can_start": can_start,
         "revise_disabled_reason": "" if can_start else reason,
         "revise_targets": target_ids,
@@ -13614,8 +14134,60 @@ def _task_revise_api(task: Task) -> Dict[str, object]:
         ),
         "revise_whole_rework": bool(task and not task.subtasks),
         "revise_owner_role": task.owner_role,
-        "revise_at_limit": task.revise_round >= MAX_REVISE_ROUNDS,
+        "revise_at_limit": task.revise_round >= MAX_REVISE_ROUNDS and not resumable,
     }
+
+
+def _task_api_record(task: Task) -> dict:
+    phase = _task_phase(task)
+    delivered, evidence = _delivery_evidence(task)
+    handoff = _handoff_state_snapshot(task.task_id)
+    return {
+        "id": task.task_id,
+        "title": task.title,
+        "status": _task_status_from_phase(task, phase),
+        "phase": phase,
+        "phase_label": _phase_label(phase),
+        "phase_tone": _phase_tone(phase),
+        "mtime": _iso_time(task.mtime),
+        "mtime_display": _fmt_time(task.mtime),
+        "mtime_epoch": task.mtime,
+        "rounds": task.rounds,
+        "has_delivery": delivered,
+        "delivery_evidence": evidence,
+        "delivery_folder": task.delivery.folder if task.delivery else None,
+        "handoff_blocked": _handoff_blocked_for(task.task_id),
+        "handoff": handoff,
+        "handoff_retry_url": f"/handoff/retry/{task.task_id}",
+        "has_review": task.review_path is not None,
+        "has_review_done": (task.docking_dir / REVIEW_DONE_NAME).is_file(),
+        "review_verdict": _review_terminal_verdict(task),
+        "project": task.project_name,
+        "project_path": _display_path(task.project_dir),
+        "desk_root": str(PROJECT_DIR),
+        "workdir": str(task.workdir),
+        "work_mode": task.work_mode,
+        "work_mode_label": workspace_policy.MODES.get(task.work_mode, task.work_mode),
+        "workdir_is_custom": task.uses_custom_workdir,
+        "owner_role": task.owner_role,
+        "meta_path": _display_path(task.meta_path),
+        "task_file": task.path.name,
+        "task_path": _display_path(task.path),
+        "docking_path": _display_path(task.docking_dir),
+        "workspace_path": _display_path(task.workspace_dir),
+        "docking_file_count": len(_collect_files(task.docking_dir)),
+        "workspace_file_count": len(_collect_files(task.workspace_dir)),
+        "registration_status": task.registration_status,
+        "registered_at": task.registered_at,
+        "controller_agent": task.controller_agent,
+        "subtask_total": len(task.subtasks),
+        "subtask_done": task.subtasks_done,
+        "subtasks_total": len(task.subtasks),
+        "subtasks_done": task.subtasks_done,
+        "subtasks_error": task.subtasks_error,
+        **_task_revise_api(task, phase=phase),
+        "detail_url": f"/task/{task.task_id}",
+}
 
 
 def _tasks_api_payload(tasks: List[Task]) -> dict:
@@ -13625,50 +14197,7 @@ def _tasks_api_payload(tasks: List[Task]) -> dict:
         "count": len(tasks),
         "counts": counts,
         "tasks": [
-            {
-                "id": task.task_id,
-                "title": task.title,
-                "status": _task_status_from_phase(task, _task_phase(task)),
-                "phase": _task_phase(task),
-                "phase_label": _phase_label(_task_phase(task)),
-                "phase_tone": _phase_tone(_task_phase(task)),
-                "mtime": _iso_time(task.mtime),
-                "mtime_display": _fmt_time(task.mtime),
-                "mtime_epoch": task.mtime,
-                "rounds": task.rounds,
-                "has_delivery": _delivery_evidence(task)[0],
-                "delivery_evidence": _delivery_evidence(task)[1],
-                "delivery_folder": task.delivery.folder if task.delivery else None,
-                "handoff_blocked": _handoff_blocked_for(task.task_id),
-                "handoff": _handoff_state_snapshot(task.task_id),
-                "handoff_retry_url": f"/handoff/retry/{task.task_id}",
-                "has_review": task.review_path is not None,
-                "has_review_done": (task.docking_dir / REVIEW_DONE_NAME).is_file(),
-                "review_verdict": _review_terminal_verdict(task),
-                "project": task.project_name,
-                "project_path": _display_path(task.project_dir),
-                "desk_root": str(PROJECT_DIR),
-                "workdir": str(task.workdir),
-                "workdir_is_custom": task.uses_custom_workdir,
-                "owner_role": task.owner_role,
-                "meta_path": _display_path(task.meta_path),
-                "task_file": task.path.name,
-                "task_path": _display_path(task.path),
-                "docking_path": _display_path(task.docking_dir),
-                "workspace_path": _display_path(task.workspace_dir),
-                "docking_file_count": len(_collect_files(task.docking_dir)),
-                "workspace_file_count": len(_collect_files(task.workspace_dir)),
-                "registration_status": task.registration_status,
-                "registered_at": task.registered_at,
-                "controller_agent": task.controller_agent,
-                "subtask_total": len(task.subtasks),
-                "subtask_done": task.subtasks_done,
-                "subtasks_total": len(task.subtasks),
-                "subtasks_done": task.subtasks_done,
-                "subtasks_error": task.subtasks_error,
-                **_task_revise_api(task),
-                "detail_url": f"/task/{task.task_id}",
-            }
+            _task_api_record(task)
             for task in tasks
         ],
     }
@@ -13733,6 +14262,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         normalized = path.rstrip("/") or "/"
+
+        if normalized == "/api/queue":
+            try:
+                self._send_json(200, _queue_payload(candidates=parse_qs(urlsplit(self.path).query).get("candidates") == ["1"]))
+            except queue_engine.QueueError as exc:
+                self._send_json(409, {"ok": False, "message": str(exc)})
+            return
 
         if normalized == "/":
             self._send(200, _render_dashboard(_load_tasks()))
@@ -14033,21 +14569,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         if normalized in {
             "/static/confirm.js",
+            "/static/console.js",
             "/static/new-task.js",
             "/static/registering.js",
             "/static/dispatch.js",
             "/static/review.js",
             "/static/advance.js",
             "/static/revise.js",
+            "/static/queue.js",
         }:
             script_file = {
                 "/static/confirm.js": CONFIRM_SCRIPT_FILE,
+                "/static/console.js": CONSOLE_SCRIPT_FILE,
                 "/static/new-task.js": NEW_TASK_SCRIPT_FILE,
                 "/static/registering.js": REGISTERING_SCRIPT_FILE,
                 "/static/dispatch.js": DISPATCH_SCRIPT_FILE,
                 "/static/review.js": REVIEW_SCRIPT_FILE,
                 "/static/advance.js": ADVANCE_SCRIPT_FILE,
                 "/static/revise.js": REVISE_SCRIPT_FILE,
+                "/static/queue.js": QUEUE_SCRIPT_FILE,
             }[normalized]
             try:
                 script = script_file.read_text(encoding="utf-8")
@@ -14161,6 +14701,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         path = urlsplit(self.path).path
         normalized = path.rstrip("/") or "/"
+
+        if normalized.startswith("/api/queue/"):
+            self._handle_queue_post(normalized.rsplit("/", 1)[-1])
+            return
+
+        if re.fullmatch(r"/(?:advance|dispatch|review|revise)/T\d+|/register/T\d+/retry|/handoff/retry/T\d+", normalized, re.I):
+            try:
+                _queue_check_start("")
+            except ActionError as exc:
+                self._dispatch_error_response(exc)
+                return
 
         if normalized == "/new":
             self._handle_new_post()
@@ -14506,7 +15057,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "等待推进结束后再修改。",
                 )
             fields = self._read_urlencoded_form()
-            new_workdir = _update_task_workdir(task, fields.get("workdir", ""))
+            new_workdir = _update_task_workdir(task, fields.get("workdir", ""), fields.get("work_mode"))
         except ActionError as exc:
             self._workdir_error_response(
                 exc.status, exc.title, exc.message, exc.hint
@@ -14517,7 +15068,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 400,
                 "工作目录没有更新",
                 str(exc),
-                "填写绝对路径；系统根内只允许 `项目/<编号>_<短名>/工作区/`。",
+                "填写项目绝对路径；修改本系统请选择“维护工作台自身”。",
             )
             return
 
@@ -14797,7 +15348,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "message": "已停止全自动推进；当前 Agent 已终止，执行器锁已检查。",
+                    "message": ("正在停止，等待当前步骤完成清理。" if final.get("stopping") else "已停止全自动推进；当前 Agent 已终止，执行器锁已检查。"),
                     "advance": final,
                     "status_url": f"/api/task/{task_id}/advance-status",
                 },
@@ -14862,6 +15413,54 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: object) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         self._send(status, body, content_type="application/json; charset=utf-8")
+
+    def _handle_queue_post(self, action: str) -> None:
+        try:
+            fields = self._read_urlencoded_form(
+                field_names=("tasks", "ids", "request_id", "workdir", "work_mode", "id", "order_revision"),
+                allow_empty=True,
+            )
+            queue = _task_queue()
+            if action == "batch":
+                self._send_json(201, _create_queue_batch(fields))
+                return
+            if action == "add":
+                ids = json.loads(fields.get("ids") or "[]")
+                if not isinstance(ids, list) or not ids or len(ids) > queue_engine.MAX_ITEMS or any(not isinstance(task_id, str) or not TASK_ID_RE.fullmatch(task_id) for task_id in ids):
+                    raise FormError("请选择有效的任务编号。")
+                ids = [task_id.upper() for task_id in ids]
+                if len(set(ids)) != len(ids):
+                    raise FormError("同一任务只能选择一次。")
+                available = {item["id"]: item for item in _queue_candidates()}
+                already = {item["id"] for item in queue.snapshot()["items"]}
+                if any(task_id not in available and task_id not in already for task_id in ids):
+                    raise FormError("部分任务已归档或审核通过，请刷新后重新选择。")
+                queue.append([queue_engine.TaskQueue.item(task_id, available[task_id]["title"]) for task_id in ids if task_id not in already])
+            elif action == "start":
+                with PROCESS_START_LOCK:
+                    if SHUTTING_DOWN.is_set():
+                        raise FormError("控制台正在退出，请稍后再试。")
+                    if (ACTIVE_REGISTRATIONS or _active_advance_task() or _active_dispatch_task()
+                            or _active_review_task() or _active_handoff_task() or _runner().lock_info().get("active")):
+                        raise FormError("执行器正忙，等待当前运行结束后再开始队列。")
+                    queue.start()
+            elif action == "pause":
+                queue.pause()
+            elif action in {"reorder", "remove", "clear_completed"}:
+                ids = json.loads(fields.get("ids") or "[]")
+                if not isinstance(ids, list) or any(not isinstance(task_id, str) for task_id in ids):
+                    raise FormError("任务顺序格式无效。")
+                revision = fields.get("order_revision")
+                queue.edit(action, fields.get("id", ""), ids=ids,
+                           order_revision=int(revision) if revision is not None else None)
+            else:
+                self._send_json(404, {"ok": False, "message": "没有这个队列操作。"})
+                return
+            self._send_json(200, _queue_payload())
+        except (FormError, queue_engine.QueueError, ValueError, TypeError) as exc:
+            self._send_json(409 if isinstance(exc, queue_engine.QueueError) else 400, {"ok": False, "message": str(exc)})
+        except ActionError as exc:
+            self._dispatch_error_response(exc)
 
     def _handle_publish_post(self) -> None:
         values: Dict[str, str] = {name: "" for name in PUBLISH_FIELDS}
@@ -15034,7 +15633,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _handle_validate_folder_post(self) -> None:
         try:
             fields = self._read_urlencoded_form()
-            folder = _validate_project_folder(fields.get("workdir", ""))
+            folder = _validate_project_folder(fields.get("workdir", ""), fields.get("work_mode", workspace_policy.ISOLATED))
         except FormError as exc:
             self._send_json(400, {"ok": False, "error": str(exc)})
             return
@@ -15117,7 +15716,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         valid = True
         error = ""
         try:
-            path = _validate_project_folder(str(path))
+            chosen_mode = parse_qs(urlsplit(self.path).query).get("work_mode", [workspace_policy.ISOLATED])[0]
+            path = _validate_project_folder(str(path), chosen_mode)
         except FormError as exc:
             valid = False
             error = str(exc)
@@ -15164,7 +15764,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise FormError("表单字段过多，未写入配置。")
         return {name: values[-1] for name, values in parsed.items()}
 
-    def _read_urlencoded_form(self) -> Dict[str, str]:
+    def _read_urlencoded_form(self, *, field_names=None, allow_empty=False) -> Dict[str, str]:
+        if allow_empty and self.headers.get("Content-Length", "0") == "0":
+            return {}
         content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
         if content_type != "application/x-www-form-urlencoded":
             raise FormError("表单格式无效，请从控制台页面提交。")
@@ -15188,7 +15790,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(decoded, keep_blank_values=True)
         return {
             name: parsed.get(name, [""])[-1]
-            for name in FORM_FIELDS
+            for name in (FORM_FIELDS if field_names is None else field_names)
             if name in parsed
         }
 
@@ -15361,6 +15963,7 @@ def main() -> None:
         print(
             "[执行器] 已把上次未收尾的运行标记为 failed；锁已检查并释放。"
         )
+    _task_queue()  # Recover interrupted queues as paused; never restart them implicitly.
     stale_registrations = _reconcile_stale_registrations()
     if stale_registrations:
         print(
@@ -15396,6 +15999,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n正在停止...")
     finally:
+        with PROCESS_START_LOCK:
+            SHUTTING_DOWN.set()
+            _task_queue().pause()
+            workflow = _workflow_for(_active_advance_task())
+            if workflow is not None:
+                workflow["stop_requested"] = True
         try:
             RUNNER.shutdown()
         except Exception:

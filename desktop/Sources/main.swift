@@ -327,7 +327,7 @@ enum ProcessKiller {
     }
 
     /// 退出应用时使用：等待一小段时间，必要时强制杀掉。
-    static func terminateAndWait(_ process: Process?, grace: TimeInterval = 2.0) {
+    static func terminateAndWait(_ process: Process?, grace: TimeInterval = 2.0, beforeKill: (() -> Void)? = nil) {
         guard let process, process.isRunning else { return }
         let pid = process.processIdentifier
         process.terminate()
@@ -336,6 +336,7 @@ enum ProcessKiller {
             usleep(50_000)
         }
         if process.isRunning {
+            beforeKill?()
             kill(pid, SIGKILL)
             usleep(100_000)
         }
@@ -351,6 +352,7 @@ final class ConsoleController {
         let ownedPID: pid_t?
         let portOpen: Bool
         let restarting: Bool
+        let stopping: Bool
         let restartCount: Int
         let lastRestartAt: Date?
         let healthFailures: Int
@@ -367,6 +369,8 @@ final class ConsoleController {
     private let watchdogInterval: TimeInterval
     private let startupGrace: TimeInterval
 
+    // Runner allows 3s TERM + process-group cleanup; give it time to finish.
+    private let shutdownGrace: TimeInterval = 12.0
     private var process: Process?
     private var outputHandle: FileHandle?
     private var restartWork: DispatchWorkItem?
@@ -406,7 +410,8 @@ final class ConsoleController {
         return Snapshot(
             ownedPID: ownedPID,
             portOpen: portOpen,
-            restarting: restartWork != nil,
+            restarting: restartWork != nil || restartAfterTermination,
+            stopping: stopping,
             restartCount: restartCount,
             lastRestartAt: lastRestartAt,
             healthFailures: healthFailures,
@@ -474,15 +479,15 @@ final class ConsoleController {
             )
             stopping = false
             process.terminate()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self, weak process] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + shutdownGrace) { [weak self, weak process] in
                 guard
                     let self,
                     let process,
                     self.process === process,
                     process.isRunning
                 else { return }
-                kill(process.processIdentifier, SIGKILL)
-                self.log("PID \(pid) 未在 1.5 秒内退出，已强制结束。")
+                self.forceStop(process)
+                self.log("PID \(pid) 未在 12 秒内退出，已强制结束。")
             }
             scheduleRestart()
             onChange?()
@@ -658,11 +663,8 @@ final class ConsoleController {
             }
             if let process = self.process, process.isRunning {
                 let pid = process.processIdentifier
-                self.log("健康重启前进程 PID \(pid) 仍存活，强制结束并继续退避。")
-                kill(pid, SIGKILL)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                    self?.scheduleRestart()
-                }
+                self.log("进程 PID \(pid) 正在清理 Agent，等待退出后继续重启。")
+                self.scheduleRestart()
                 return
             }
             self.start(manual: false)
@@ -685,15 +687,15 @@ final class ConsoleController {
             let pid = process.processIdentifier
             log("正在停止控制台（PID \(pid)）；手动停止后不再自动拉起。")
             process.terminate()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak process] in
+            DispatchQueue.main.asyncAfter(deadline: .now() + shutdownGrace) { [weak self, weak process] in
                 guard
                     let self,
                     let process,
                     self.process === process,
                     process.isRunning
                 else { return }
-                kill(process.processIdentifier, SIGKILL)
-                self.log("控制台未在 2 秒内退出，已强制结束（PID \(pid)）。")
+                self.forceStop(process)
+                self.log("控制台未在 12 秒内退出，已强制结束（PID \(pid)）。")
             }
             onChange?()
             return
@@ -718,9 +720,9 @@ final class ConsoleController {
             let pid = process.processIdentifier
             log("重启控制台（PID \(pid)）。")
             process.terminate()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak process] in
-                if let process, process.isRunning {
-                    kill(process.processIdentifier, SIGKILL)
+            DispatchQueue.main.asyncAfter(deadline: .now() + shutdownGrace) { [weak self, weak process] in
+                if let self, let process, self.process === process, process.isRunning {
+                    self.forceStop(process)
                 }
             }
             onChange?()
@@ -733,6 +735,28 @@ final class ConsoleController {
         start(manual: true)
     }
 
+    private func cleanupOwnedAgent(consolePID: pid_t) {
+        let lockURL = projectRoot.appendingPathComponent("协作/调度台/runner.lock")
+        guard let text = try? String(contentsOf: lockURL, encoding: .utf8) else { return }
+        var fields: [String: String] = [:]
+        for line in text.components(separatedBy: .newlines) {
+            let parts = line.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                fields[parts[0].trimmingCharacters(in: .whitespaces)] = parts[1].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        guard let owner = fields["owner_pid"].flatMap(Int32.init), owner == consolePID,
+              let agent = fields["agent_pid"].flatMap(Int32.init), agent > 1,
+              agent != getpgrp(), kill(-agent, 0) == 0 else { return }
+        kill(-agent, SIGKILL)
+        log("控制台清理超时，已结束本实例拥有的 Agent 进程组 \(agent)。")
+    }
+
+    private func forceStop(_ process: Process) {
+        cleanupOwnedAgent(consolePID: process.processIdentifier)
+        kill(process.processIdentifier, SIGKILL)
+    }
+
     func shutdownSync() {
         shuttingDown = true
         wantsToRun = false
@@ -743,7 +767,9 @@ final class ConsoleController {
 
         if let process, process.isRunning {
             log("菜单栏应用退出，停止受控控制台（PID \(process.processIdentifier)）。")
-            ProcessKiller.terminateAndWait(process)
+            ProcessKiller.terminateAndWait(process, grace: shutdownGrace) { [self] in
+                cleanupOwnedAgent(consolePID: process.processIdentifier)
+            }
         }
         try? outputHandle?.close()
         outputHandle = nil
@@ -1246,6 +1272,153 @@ final class GuardController {
 // AppKit 菜单栏
 // -----------------------------------------------------------------------------
 
+/// 菜单与 URL 控制入口共用页面定义，避免标签和跳转地址各自维护。
+enum ConsolePage: String, CaseIterable {
+    case dashboard, newTask, runs, dispatch, roles, agents, archive
+
+    var title: String {
+        switch self {
+        case .dashboard: return "打开任务看板"
+        case .newTask: return "发布新任务…"
+        case .runs: return "查看运行记录"
+        case .dispatch: return "查看调度台"
+        case .roles: return "角色配置"
+        case .agents: return "Agent 应用"
+        case .archive: return "归档库"
+        }
+    }
+
+    var path: String {
+        switch self {
+        case .dashboard: return "/"
+        case .newTask: return "/new"
+        case .runs: return "/runs"
+        case .dispatch: return "/dispatch"
+        case .roles: return "/roles"
+        case .agents: return "/agents"
+        case .archive: return "/archive"
+        }
+    }
+
+    var command: String {
+        switch self {
+        case .dashboard: return "open-web"
+        case .newTask: return "new-task"
+        default: return "open-" + rawValue
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .dashboard: return "square.grid.2x2"
+        case .newTask: return "plus.square"
+        case .runs: return "clock.arrow.circlepath"
+        case .dispatch: return "waveform.path.ecg"
+        case .roles: return "person.2"
+        case .agents: return "terminal"
+        case .archive: return "archivebox"
+        }
+    }
+
+    func url(port: UInt16 = RuntimePaths.consolePort) -> URL {
+        URL(string: "http://127.0.0.1:\(port)\(path)")!
+    }
+}
+
+struct ConsoleMenuState {
+    let snapshot: ConsoleController.Snapshot
+    let terminating: Bool
+
+    var status: String {
+        let note = snapshot.restartCount > 0 ? " · 已自动恢复 \(snapshot.restartCount) 次" : ""
+        if terminating { return "控制台：正在退出…" }
+        if snapshot.stopping { return "控制台：正在停止并清理任务…" }
+        if snapshot.restarting { return "控制台：正在重启…" + note }
+        if snapshot.external { return "控制台：已连接外部服务" }
+        if snapshot.portOpen { return "控制台：就绪" + note }
+        if snapshot.ownedPID != nil { return "控制台：正在启动…" + note }
+        return "控制台：未启动（打开页面时自动启动）"
+    }
+
+    var powerTitle: String {
+        if snapshot.stopping { return "正在停止控制台…" }
+        if snapshot.external { return "停止控制台（由外部启动）" }
+        if snapshot.ownedPID != nil { return "停止控制台" }
+        if snapshot.restarting || snapshot.wantsToRun { return "取消控制台启动" }
+        return "启动控制台"
+    }
+
+    var canNavigate: Bool { !terminating && !snapshot.stopping }
+    var canControl: Bool { !terminating && !snapshot.stopping && !snapshot.external }
+    var canRestart: Bool {
+        canControl && snapshot.ownedPID != nil && !snapshot.restarting && snapshot.portOpen
+    }
+}
+
+/// 只在本地服务就绪后打开页面。连续选择时保留最后一个目标，停止/退出可取消。
+final class ConsolePageNavigator {
+    private let isReady: () -> Bool
+    private let start: () -> Void
+    private let open: (URL) -> Void
+    private let failed: (URL) -> Void
+    private let timeout: TimeInterval
+    private let pollInterval: TimeInterval
+    private var pending: URL?
+    private var deadline = Date.distantPast
+    private var work: DispatchWorkItem?
+
+    init(
+        timeout: TimeInterval = 30,
+        pollInterval: TimeInterval = 0.25,
+        isReady: @escaping () -> Bool,
+        start: @escaping () -> Void,
+        open: @escaping (URL) -> Void,
+        failed: @escaping (URL) -> Void
+    ) {
+        self.timeout = timeout
+        self.pollInterval = pollInterval
+        self.isReady = isReady
+        self.start = start
+        self.open = open
+        self.failed = failed
+    }
+
+    func request(_ url: URL) {
+        cancel()
+        if isReady() {
+            open(url)
+            return
+        }
+        pending = url
+        deadline = Date().addingTimeInterval(timeout)
+        start()
+        check()
+    }
+
+    func cancel() {
+        work?.cancel()
+        work = nil
+        pending = nil
+    }
+
+    private func check() {
+        guard let url = pending else { return }
+        if isReady() {
+            cancel()
+            open(url)
+        } else if Date() >= deadline {
+            cancel()
+            failed(url)
+        } else {
+            let next = DispatchWorkItem { [weak self] in self?.check() }
+            work = next
+            DispatchQueue.main.asyncAfter(deadline: .now() + pollInterval, execute: next)
+        }
+    }
+
+    deinit { work?.cancel() }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var consoleController: ConsoleController!
@@ -1255,17 +1428,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isTerminating = false
     private var pendingControlURLs: [URL] = []
     private var controlTokenValue = ""
+    private var openPageURL: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    private lazy var pageNavigator = ConsolePageNavigator(
+        isReady: { [weak self] in
+            guard let snapshot = self?.consoleController?.snapshot() else { return false }
+            return snapshot.portOpen && !snapshot.stopping && !snapshot.restarting
+        },
+        start: { [weak self] in
+            guard let controller = self?.consoleController else { return }
+            let snapshot = controller.snapshot()
+            if !snapshot.running && !snapshot.restarting {
+                controller.start(manual: true)
+            }
+        },
+        open: { [weak self] url in self?.openPageURL(url) },
+        failed: { [weak self] url in self?.showPageOpenFailure(url) }
+    )
 
     private var consoleStatusItem: NSMenuItem!
-    private var startConsoleItem: NSMenuItem!
-    private var stopConsoleItem: NSMenuItem!
+    private var consolePowerItem: NSMenuItem!
     private var restartConsoleItem: NSMenuItem!
-    private var openWebItem: NSMenuItem!
+    private var pageItems: [NSMenuItem] = []
     private var guardStatusItem: NSMenuItem!
-    private var startGuardItem: NSMenuItem!
-    private var stopGuardItem: NSMenuItem!
+    private var guardPowerItem: NSMenuItem!
     private var openProjectItem: NSMenuItem!
-    private var openLogItem: NSMenuItem!
+    private var logItems: [NSMenuItem] = []
     private var quitItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1292,7 +1479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         prepareControlToken()
         buildStatusItem()
-        buildMenu()
+        statusItem.menu = buildMenu()
         refreshUI()
         consoleController.startWatchdog()
 
@@ -1367,15 +1554,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
+        if let page = ConsolePage.allCases.first(where: { $0.command == command }) {
+            openPage(page)
+            return
+        }
         switch command {
         case "start-console": startConsoleAction()
         case "stop-console": stopConsoleAction()
         case "restart-console": restartConsoleAction()
-        case "open-web": openWebAction()
         case "start-guard": startGuardAction()
         case "stop-guard": stopGuardAction()
         case "open-project": openProjectAction()
         case "open-log": openLogAction()
+        case "open-console-log": openConsoleLogAction()
+        case "open-log-folder": openLogFolderAction()
         case "quit": quitAction()
         case "dump-menu": dumpMenuSnapshot(reason: "URL 请求")
         default:
@@ -1386,13 +1578,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func dumpMenuSnapshot(reason: String) {
         guard let menu = statusItem.menu else { return }
         var lines = ["\n[菜单快照] \(Clock.display()) \(reason)"]
-        for item in menu.items {
-            if item.isSeparatorItem {
-                lines.append("---")
-            } else {
-                lines.append("[\(item.isEnabled ? "启用" : "禁用")] \(item.title)")
+        func appendItems(_ menu: NSMenu, indent: String = "") {
+            for item in menu.items {
+                if item.isSeparatorItem {
+                    lines.append(indent + "---")
+                } else {
+                    lines.append(indent + "[\(item.isEnabled ? "启用" : "禁用")] \(item.title)")
+                    if let submenu = item.submenu { appendItems(submenu, indent: indent + "  ") }
+                }
             }
         }
+        refreshUI()
+        appendItems(menu)
         lines.append("")
         FileIO.append(lines.joined(separator: "\n") + "\n", to: RuntimePaths.consoleLog)
     }
@@ -1401,6 +1598,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isTerminating = true
         refreshTimer?.invalidate()
         refreshTimer = nil
+        pageNavigator.cancel()
         guardController.shutdownSync()
         consoleController.shutdownSync()
     }
@@ -1416,50 +1614,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func makeItem(
         _ title: String,
         action: Selector? = nil,
-        enabled: Bool = true
+        enabled: Bool = true,
+        key: String = "",
+        symbol: String? = nil,
+        identifier: String? = nil,
+        toolTip: String? = nil
     ) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
         item.target = action == nil ? nil : self
         item.isEnabled = enabled
+        item.toolTip = toolTip
+        if let identifier { item.identifier = NSUserInterfaceItemIdentifier(identifier) }
+        if let symbol {
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            item.image?.size = NSSize(width: 16, height: 16)
+        }
         return item
     }
 
-    private func buildMenu() {
-        let menu = NSMenu()
+    private func makeMenu(_ title: String) -> NSMenu {
+        let menu = NSMenu(title: title)
         menu.autoenablesItems = false
         menu.delegate = self
+        return menu
+    }
 
-        consoleStatusItem = makeItem("控制台：○ 已停止", enabled: false)
-        startConsoleItem = makeItem("启动控制台", action: #selector(startConsoleAction))
-        stopConsoleItem = makeItem("停止控制台", action: #selector(stopConsoleAction))
-        restartConsoleItem = makeItem("重启控制台", action: #selector(restartConsoleAction))
-        openWebItem = makeItem("打开网页", action: #selector(openWebAction))
-        guardStatusItem = makeItem("守卫：○ 已停止", enabled: false)
-        startGuardItem = makeItem("启动守卫", action: #selector(startGuardAction))
-        stopGuardItem = makeItem("停止守卫", action: #selector(stopGuardAction))
-        openProjectItem = makeItem("打开项目文件夹", action: #selector(openProjectAction))
-        openLogItem = makeItem("打开日志", action: #selector(openLogAction))
-        quitItem = makeItem("退出", action: #selector(quitAction))
+    private func makePageItem(_ page: ConsolePage, key: String = "") -> NSMenuItem {
+        let item = makeItem(
+            page.title, action: #selector(openPageAction(_:)), key: key,
+            symbol: page.symbol, identifier: page.command,
+            toolTip: "控制台未启动时会先自动启动，再打开此页面。"
+        )
+        item.representedObject = page.rawValue
+        pageItems.append(item)
+        return item
+    }
 
+    private func buildMenu() -> NSMenu {
+        pageItems.removeAll()
+        logItems.removeAll()
+        let menu = makeMenu("多智能体协作台")
+
+        // 日常路径：看任务 → 发布 → 查运行；进程维护放进子菜单。
+        menu.addItem(makePageItem(.dashboard, key: "o"))
+        menu.addItem(makePageItem(.newTask, key: "n"))
+        menu.addItem(makePageItem(.runs, key: "r"))
+        menu.addItem(.separator())
+        consoleStatusItem = makeItem("控制台：未启动", enabled: false)
+        guardStatusItem = makeItem("文件守卫：已暂停", enabled: false,
+                                   toolTip: "记录任务文件变化；暂停不会停止任务执行。")
+        menu.addItem(consoleStatusItem)
+        menu.addItem(guardStatusItem)
+        menu.addItem(.separator())
+
+        let management = makeMenu("项目管理")
+        [ConsolePage.roles, .agents, .archive].forEach { management.addItem(makePageItem($0)) }
+        management.addItem(.separator())
+        openProjectItem = makeItem("打开项目文件夹", action: #selector(openProjectAction), symbol: "folder")
+        management.addItem(openProjectItem)
+        let managementItem = makeItem("项目管理", symbol: "slider.horizontal.3")
+        managementItem.submenu = management
+        menu.addItem(managementItem)
+
+        let maintenance = makeMenu("运行与维护")
+        maintenance.addItem(makePageItem(.dispatch))
+        maintenance.addItem(.separator())
+        consolePowerItem = makeItem(
+            "启动控制台", action: #selector(toggleConsoleAction), symbol: "power",
+            identifier: "toggle-console",
+            toolTip: "停止控制台会中断正在执行的任务，并关闭自动重启。"
+        )
+        restartConsoleItem = makeItem(
+            "重启控制台", action: #selector(restartConsoleAction), symbol: "arrow.clockwise",
+            identifier: "restart-console", toolTip: "先停止当前任务与控制台，再重新启动服务。"
+        )
+        guardPowerItem = makeItem(
+            "恢复文件守卫", action: #selector(toggleGuardAction), symbol: "eye",
+            identifier: "toggle-guard", toolTip: "只影响文件变化记录，不会停止或启动任务。"
+        )
+        logItems = [
+            makeItem("打开控制台日志", action: #selector(openConsoleLogAction), symbol: "doc.text"),
+            makeItem("打开文件守卫日志", action: #selector(openLogAction), symbol: "doc.text"),
+            makeItem("打开日志文件夹", action: #selector(openLogFolderAction), symbol: "folder"),
+        ]
         [
-            consoleStatusItem,
-            startConsoleItem,
-            stopConsoleItem,
+            consolePowerItem,
             restartConsoleItem,
             NSMenuItem.separator(),
-            openWebItem,
+            guardPowerItem,
             NSMenuItem.separator(),
-            guardStatusItem,
-            startGuardItem,
-            stopGuardItem,
-            NSMenuItem.separator(),
-            openProjectItem,
-            openLogItem,
-            NSMenuItem.separator(),
-            quitItem,
-        ].forEach { menu.addItem($0) }
+        ].forEach { maintenance.addItem($0) }
+        logItems.forEach { maintenance.addItem($0) }
+        let maintenanceItem = makeItem("运行与维护", symbol: "gearshape")
+        maintenanceItem.submenu = maintenance
+        menu.addItem(maintenanceItem)
+        menu.addItem(.separator())
 
-        statusItem.menu = menu
+        quitItem = makeItem(
+            "退出协作菜单栏", action: #selector(quitAction), key: "q",
+            toolTip: "退出并停止本应用启动的控制台及文件守卫。外部启动的控制台继续运行。"
+        )
+        menu.addItem(quitItem)
+        return menu
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -1474,44 +1730,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard consoleController != nil, guardController != nil else { return }
         let consoleSnapshot = consoleController.snapshot()
         let guardActive = guardController.enabled
-        let restartNote = consoleSnapshot.restartCount > 0
-            ? " · 已重启 \(consoleSnapshot.restartCount) 次"
-            : ""
-
-        if consoleSnapshot.restarting {
-            consoleStatusItem.title = "控制台：◌ 重启中…\(restartNote)"
-        } else if consoleSnapshot.ownedPID != nil {
-            consoleStatusItem.title = "控制台：● 运行中\(restartNote)"
-        } else if consoleSnapshot.portOpen {
-            consoleStatusItem.title = "控制台：● 运行中（外部）\(restartNote)"
-        } else {
-            consoleStatusItem.title = "控制台：○ 已停止\(restartNote)"
-        }
-
-        guardStatusItem.title = guardActive ? "守卫：● 常驻中" : "守卫：○ 已停止"
-
-        startConsoleItem.isEnabled = !consoleSnapshot.running && !consoleSnapshot.restarting && !isTerminating
-        stopConsoleItem.isEnabled = (
-            consoleSnapshot.ownedPID != nil
-                || consoleSnapshot.restarting
-                || consoleSnapshot.wantsToRun
-        ) && !isTerminating
-        restartConsoleItem.isEnabled = (
-            consoleSnapshot.ownedPID != nil
-                || consoleSnapshot.restarting
-                || consoleSnapshot.wantsToRun
-        ) && !isTerminating
-        openWebItem.isEnabled = !isTerminating
-        startGuardItem.isEnabled = !guardActive && !isTerminating
-        stopGuardItem.isEnabled = guardActive && !isTerminating
-        openProjectItem.isEnabled = !isTerminating
-        openLogItem.isEnabled = !isTerminating
-        quitItem.isEnabled = !isTerminating
+        applyMenuState(consoleSnapshot, guardEnabled: guardActive, guardPhase: guardController.phase)
 
         let consoleOn = consoleSnapshot.running
         let dot: String
         let dotColor: NSColor
-        if consoleOn && guardActive {
+        if consoleOn && consoleSnapshot.portOpen && !consoleSnapshot.restarting && !consoleSnapshot.stopping && guardActive {
             dot = "●"
             dotColor = .systemGreen
         } else if consoleOn || guardActive {
@@ -1542,13 +1766,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let lastRestart = consoleSnapshot.lastRestartAt.map {
             "，最近 " + Clock.display($0)
         } ?? ""
-        statusItem.button?.toolTip = [
-            "控制台：" + (consoleSnapshot.ownedPID.map { "运行中，PID \($0)" } ?? (consoleSnapshot.portOpen ? "运行中（外部）" : "已停止"))
-                + (consoleSnapshot.restartCount > 0
-                    ? "，已重启 \(consoleSnapshot.restartCount) 次\(lastRestart)"
-                    : ""),
-            "守卫：" + (guardActive ? "常驻中" : "已停止"),
-        ].joined(separator: " · ")
+        statusItem.button?.toolTip = [consoleStatusItem.title + lastRestart, guardStatusItem.title].joined(separator: "\n")
+    }
+
+    private func applyMenuState(
+        _ snapshot: ConsoleController.Snapshot,
+        guardEnabled: Bool,
+        guardPhase: GuardController.Phase
+    ) {
+        let state = ConsoleMenuState(snapshot: snapshot, terminating: isTerminating)
+        consoleStatusItem.title = state.status
+        if !guardEnabled {
+            guardStatusItem.title = "文件守卫：已暂停"
+        } else {
+            switch guardPhase {
+            case .watching: guardStatusItem.title = "文件守卫：正在监测"
+            case .acking: guardStatusItem.title = "文件守卫：正在记录变更"
+            case .waiting: guardStatusItem.title = "文件守卫：等待重新监测"
+            case .idle: guardStatusItem.title = "文件守卫：准备监测"
+            }
+        }
+        consolePowerItem.title = state.powerTitle
+        consolePowerItem.isEnabled = state.canControl
+        if snapshot.external {
+            consolePowerItem.toolTip = "当前服务由外部启动，请在原启动位置停止。"
+        } else if snapshot.ownedPID != nil {
+            consolePowerItem.toolTip = "停止会中断当前任务，并关闭控制台自动重启。"
+        } else {
+            consolePowerItem.toolTip = "网页入口会自动启动控制台，也可以在此手动管理。"
+        }
+        restartConsoleItem.isEnabled = state.canRestart
+        guardPowerItem.title = guardEnabled ? "暂停文件守卫" : "恢复文件守卫"
+        guardPowerItem.image = NSImage(systemSymbolName: guardEnabled ? "pause.circle" : "play.circle", accessibilityDescription: nil)
+        guardPowerItem.image?.size = NSSize(width: 16, height: 16)
+        guardPowerItem.isEnabled = !isTerminating
+        pageItems.forEach { $0.isEnabled = state.canNavigate }
+        openProjectItem.isEnabled = !isTerminating
+        logItems.forEach { $0.isEnabled = !isTerminating }
+        quitItem.isEnabled = !isTerminating
     }
 
     @objc private func startConsoleAction() {
@@ -1556,17 +1811,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func stopConsoleAction() {
+        pageNavigator.cancel()
         consoleController.stop()
     }
 
     @objc private func restartConsoleAction() {
+        pageNavigator.cancel()
         consoleController.restart()
     }
 
-    @objc private func openWebAction() {
-        if let url = URL(string: "http://127.0.0.1:\(RuntimePaths.consolePort)") {
-            NSWorkspace.shared.open(url)
+    @objc private func toggleConsoleAction() {
+        let snapshot = consoleController.snapshot()
+        guard ConsoleMenuState(snapshot: snapshot, terminating: isTerminating).canControl else { return }
+        if snapshot.ownedPID != nil || snapshot.restarting || snapshot.wantsToRun {
+            stopConsoleAction()
+        } else {
+            startConsoleAction()
         }
+    }
+
+    @objc private func openPageAction(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String, let page = ConsolePage(rawValue: name) else { return }
+        openPage(page)
+    }
+
+    private func openPage(_ page: ConsolePage) {
+        let state = ConsoleMenuState(snapshot: consoleController.snapshot(), terminating: isTerminating)
+        guard state.canNavigate else { return }
+        pageNavigator.request(page.url())
+    }
+
+    private func showPageOpenFailure(_ url: URL) {
+        guard !isTerminating else { return }
+        ConsoleTextLog.line("打开页面超时：控制台在 30 秒内未就绪（\(url.path)）。")
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "控制台尚未就绪"
+        alert.informativeText = "等待 30 秒后仍无法连接本地控制台。可查看控制台日志排查，或稍后从菜单重新打开页面。"
+        alert.addButton(withTitle: "查看控制台日志")
+        alert.addButton(withTitle: "稍后再试")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { openConsoleLogAction() }
     }
 
     @objc private func startGuardAction() {
@@ -1577,21 +1862,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guardController.stop(reason: "菜单操作")
     }
 
+    @objc private func toggleGuardAction() {
+        if guardController.enabled { stopGuardAction() } else { startGuardAction() }
+    }
+
     @objc private func openProjectAction() {
         NSWorkspace.shared.open(RuntimePaths.projectRoot)
     }
 
     @objc private func openLogAction() {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: RuntimePaths.journalLog.path) {
-            NSWorkspace.shared.open(RuntimePaths.journalLog)
-        } else {
-            NSWorkspace.shared.open(RuntimePaths.dispatchDir)
-        }
+        openLog(RuntimePaths.journalLog)
+    }
+
+    @objc private func openConsoleLogAction() {
+        openLog(RuntimePaths.consoleLog)
+    }
+
+    private func openLog(_ url: URL) {
+        NSWorkspace.shared.open(FileManager.default.fileExists(atPath: url.path) ? url : RuntimePaths.dispatchDir)
+    }
+
+    @objc private func openLogFolderAction() {
+        NSWorkspace.shared.open(RuntimePaths.dispatchDir)
     }
 
     @objc private func quitAction() {
         isTerminating = true
+        pageNavigator.cancel()
         NSApp.terminate(nil)
     }
 
@@ -1612,12 +1909,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// 原生菜单与页面等待逻辑自检；不启动控制台/守卫，不访问项目状态文件。
+extension AppDelegate {
+    static func runMenuSelfTest() -> Int32 {
+        _ = NSApplication.shared
+        let app = AppDelegate()
+        let menu = app.buildMenu()
+        var checks = 0
+        var failures: [String] = []
+        func check(_ condition: Bool, _ message: String) {
+            checks += 1
+            if !condition { failures.append(message) }
+        }
+        func snapshot(
+            pid: pid_t? = nil, port: Bool = false, restarting: Bool = false,
+            stopping: Bool = false, wants: Bool = false, restartCount: Int = 0
+        ) -> ConsoleController.Snapshot {
+            ConsoleController.Snapshot(
+                ownedPID: pid, portOpen: port, restarting: restarting, stopping: stopping,
+                restartCount: restartCount, lastRestartAt: nil, healthFailures: 0, wantsToRun: wants
+            )
+        }
+        func items(_ menu: NSMenu) -> [[String: Any]] {
+            menu.items.map { item in
+                if item.isSeparatorItem { return ["separator": true] }
+                var row: [String: Any] = ["title": item.title, "enabled": item.isEnabled]
+                if !item.keyEquivalent.isEmpty { row["shortcut"] = "⌘" + item.keyEquivalent.uppercased() }
+                if let id = item.identifier { row["id"] = id.rawValue }
+                if let submenu = item.submenu { row["items"] = items(submenu) }
+                return row
+            }
+        }
+        func spin(_ seconds: TimeInterval) {
+            let until = Date().addingTimeInterval(seconds)
+            while Date() < until {
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.005))
+            }
+        }
+
+        check(Array(menu.items.prefix(3)).map(\.title) == ["打开任务看板", "发布新任务…", "查看运行记录"], "常用入口顺序")
+        check(menu.items.filter { $0.submenu != nil }.map(\.title) == ["项目管理", "运行与维护"], "管理与维护分组")
+        check(app.pageItems.count == ConsolePage.allCases.count, "七个页面入口完整")
+        check(Set(app.pageItems.compactMap { $0.identifier?.rawValue }).count == 7, "页面入口唯一")
+        for page in ConsolePage.allCases {
+            let item = app.pageItems.first { $0.identifier?.rawValue == page.command }
+            check(item?.representedObject as? String == page.rawValue && item?.action != nil, "页面动作：\(page.rawValue)")
+            check(page.url(port: 18789).path == page.path && page.url(port: 18789).port == 18789, "页面地址：\(page.rawValue)")
+        }
+        check(menu.items.prefix(3).map(\.keyEquivalent) == ["o", "n", "r"] && app.quitItem.keyEquivalent == "q", "菜单快捷键")
+
+        let states: [(String, ConsoleController.Snapshot, String, String, Bool, Bool)] = [
+            ("stopped", snapshot(), "未启动", "启动控制台", true, false),
+            ("starting", snapshot(pid: 123, wants: true), "正在启动", "停止控制台", true, false),
+            ("ready", snapshot(pid: 123, port: true, wants: true), "就绪", "停止控制台", true, true),
+            ("external", snapshot(port: true), "外部服务", "停止控制台（由外部启动）", false, false),
+            ("restarting", snapshot(restarting: true, wants: true), "正在重启", "取消控制台启动", true, false),
+            ("stopping", snapshot(pid: 123, port: true, stopping: true), "正在停止", "正在停止控制台…", false, false),
+        ]
+        var stateMenus: [String: Any] = [:]
+        for (name, value, status, power, canControl, canRestart) in states {
+            app.applyMenuState(value, guardEnabled: true, guardPhase: .watching)
+            check(app.consoleStatusItem.title.contains(status), "\(name) 状态文案")
+            check(app.consolePowerItem.title == power && app.consolePowerItem.isEnabled == canControl, "\(name) 启停状态")
+            check(app.restartConsoleItem.isEnabled == canRestart, "\(name) 重启可用性")
+            check(app.pageItems.allSatisfy { $0.isEnabled == !value.stopping }, "\(name) 页面可用性")
+            check(app.guardPowerItem.title == "暂停文件守卫", "\(name) 暂停守卫")
+            stateMenus[name] = items(menu)
+        }
+        app.applyMenuState(snapshot(), guardEnabled: false, guardPhase: .idle)
+        check(app.guardPowerItem.title == "恢复文件守卫" && app.guardStatusItem.title.contains("已暂停"), "恢复守卫")
+        app.applyMenuState(snapshot(), guardEnabled: true, guardPhase: .acking)
+        check(app.guardStatusItem.title.contains("记录变更"), "守卫记录状态")
+        app.applyMenuState(snapshot(), guardEnabled: true, guardPhase: .waiting)
+        check(app.guardStatusItem.title.contains("等待重新监测"), "守卫重试状态")
+        app.isTerminating = true
+        app.applyMenuState(snapshot(pid: 123, port: true), guardEnabled: true, guardPhase: .watching)
+        check(app.pageItems.allSatisfy { !$0.isEnabled } && !app.quitItem.isEnabled
+              && !app.consolePowerItem.isEnabled && !app.guardPowerItem.isEnabled, "退出时禁止新动作")
+        app.isTerminating = false
+
+        let first = ConsolePage.dashboard.url(port: 18789)
+        let last = ConsolePage.newTask.url(port: 18789)
+        do {
+            var opened: [URL] = []
+            var starts = 0
+            let nav = ConsolePageNavigator(isReady: { true }, start: { starts += 1 }, open: { opened.append($0) }, failed: { _ in })
+            nav.request(first)
+            check(opened == [first] && starts == 0, "已就绪直接打开，不启动新实例")
+        }
+        do {
+            var ready = false
+            var opened: [URL] = []
+            var starts = 0
+            let nav = ConsolePageNavigator(pollInterval: 0.01, isReady: { ready }, start: { starts += 1 }, open: { opened.append($0) }, failed: { _ in })
+            nav.request(first)
+            check(opened.isEmpty && starts == 1, "未就绪先启动，不提前打开网页")
+            ready = true
+            spin(0.05)
+            check(opened == [first], "就绪后只打开一次")
+            spin(0.03)
+            check(opened == [first], "不会重复打开网页")
+        }
+        do {
+            var ready = false
+            var opened: [URL] = []
+            let nav = ConsolePageNavigator(pollInterval: 0.01, isReady: { ready }, start: {}, open: { opened.append($0) }, failed: { _ in })
+            nav.request(first)
+            nav.request(last)
+            ready = true
+            spin(0.05)
+            check(opened == [last], "连续选择只打开最后一个目标")
+            ready = false
+            nav.request(first)
+            nav.cancel()
+            ready = true
+            spin(0.05)
+            check(opened == [last], "停止或退出后取消待打开页面")
+        }
+        do {
+            var opened: [URL] = []
+            var failed: [URL] = []
+            let nav = ConsolePageNavigator(timeout: 0.02, pollInterval: 0.01, isReady: { false }, start: {}, open: { opened.append($0) }, failed: { failed.append($0) })
+            nav.request(first)
+            spin(0.07)
+            check(opened.isEmpty && failed == [first], "超时只报告一次，不打开故障页面")
+        }
+        let report: [String: Any] = [
+            "result": failures.isEmpty ? "PASS" : "FAIL", "checks": checks,
+            "failures": failures, "menus": stateMenus,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]),
+           let json = String(data: data, encoding: .utf8) { print(json) }
+        return failures.isEmpty ? 0 : 1
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 入口
 // -----------------------------------------------------------------------------
 
 if CommandLine.arguments.contains("--watchdog-selftest") {
     exit(WatchdogSelfTest.run())
+}
+if CommandLine.arguments.contains("--menu-selftest") {
+    exit(AppDelegate.runMenuSelfTest())
 }
 
 let application = NSApplication.shared

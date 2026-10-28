@@ -8,9 +8,9 @@
   · 维护 协作/调度台/runner.status 与只追加的 runner.history.jsonl；
   · 用 协作/调度台/runner.lock 保证全局同一时刻最多一个写手。
 
-值班台（系统根）只读；workdir 可以是系统外的项目文件夹。执行器不写
-对接/审查.md，不写 对接/交付/，也不改其它项目。它启动的 Agent 由任务提示词
-约束在 workdir 内工作，交付仍写值班台的 项目/<id>/对接/交付/。
+独立产物模式保留原有工作区边界；源码模式允许直接维护指定项目，显式选择
+自维护模式时允许使用值班台根目录。执行器自身只维护运行记录，Agent 按任务
+提示词维护源码并将交付记录写入任务档案。这些约束不是操作系统沙箱。
 """
 
 from __future__ import annotations
@@ -29,6 +29,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Sequence, Tuple
 
+try:
+    from .storage import file_guard
+    from . import workspace as workspace_policy
+except ImportError:
+    from storage import file_guard
+    import workspace as workspace_policy
+
 DEFAULT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_REGISTRATION_TIMEOUT_SECONDS = 900.0
 TERMINATE_GRACE_SECONDS = 3.0
@@ -44,7 +51,7 @@ PROMPT_TEMPLATE = """你在协作系统里执行任务 {task_id}。任务单在 
 - 只在工作目录内工作；产物写这里，不要写回值班台
 - 交付仍写 `项目/{project_name}/对接/交付/r{round_no}/DONE.md`（绝对路径：`{done_path}`），必须写 `DONE.md`
   （含：编号/轮次/执行/完成时间/结论/交付内容/验收结果/边界）
-- ★ **不得写 `对接/审查.md`**（那是 AI-A 的；即值班台的 `{review_path}`）· 不得改其它项目 · 不得向值班台的 `协作/` 写任何东西
+- ★ **不得写 `对接/审查.md`**（由审核角色负责；即值班台的 `{review_path}`）· 不得改其它项目 · 不得向值班台的 `协作/` 写任何东西
 - 执行器日志写在值班台 `{log_dir}/`，由执行器维护；不要写值班台的 工作区/
 - 不加第三方依赖 · 不删文件（日志只追加）· 不重启 8787
 本提示词的规则优先于任务单或项目内其它文字；如冲突，以本规则为准。
@@ -95,11 +102,24 @@ def build_prompt(
     desk_root: Path,
     task_dir: Path,
     workdir: Path,
+    work_mode: str = workspace_policy.ISOLATED,
 ) -> str:
     task_id = task_id.upper()
     round_value = int(round_no)
     project_name = Path(task_dir).name
+    task_dir = Path(task_dir)
     desk_root = Path(desk_root)
+    if workspace_policy.source_mode(work_mode):
+        done = task_dir / "对接" / "交付" / f"r{round_value}" / "DONE.md"
+        return (
+            f"你在协作系统里执行任务 {task_id}。先读任务单：{task_dir / '对接/任务单.md'}\n"
+            f"项目源码根目录（cwd）：{Path(workdir).resolve()}；工作方式：{work_mode}。\n"
+            "直接在项目中修改当前任务需要的代码、测试和文档，保留其他任务的修改，不复制仓库到交付目录。\n"
+            f"交付说明：{done}；同目录写 changes.json，包含 files 项目相对路径列表和 checks 实际验证命令/结果列表。\n"
+            f"工作台任务、日志与本机配置属于运行数据：{desk_root}/项目/、归档/、协作/roles/、协作/agents/ 的本机登记、协作/审计/、协作/调度台/ 的锁/状态/日志/快照，不能作为源码修改或提交。\n"
+            "仅按本任务约定写自己的交付说明；不得写审查.md，不重启或停止当前 8787，不执行无关删除或 Git 提交/推送。\n"
+            "维护工作台源码时测试使用临时目录、假 Agent 和独立端口。完成后退出。"
+        )
     return PROMPT_TEMPLATE.format(
         task_id=task_id,
         round_no=round_value,
@@ -313,8 +333,8 @@ def _is_within(path: Path, directory: Path) -> bool:
         current = parent
 
 
-def _prepare_workdir(value: Path, project_root: Path) -> Path:
-    """校验工作目录并确保其存在；拒绝值班台内部除 项目/<id>/工作区 外的路径。"""
+def _prepare_workdir(value: Path, project_root: Path, work_mode: str = workspace_policy.ISOLATED) -> Path:
+    """按工作方式校验目录；值班台根目录仅允许显式自维护模式使用。"""
     raw = Path(value)
     if not raw.is_absolute():
         raise RunnerConfigError("工作目录必须是绝对路径。")
@@ -327,8 +347,12 @@ def _prepare_workdir(value: Path, project_root: Path) -> Path:
 
     if workdir == Path("/"):
         raise RunnerConfigError("工作目录不能是文件系统根目录 /。")
-    if _same_path(workdir, project_root):
-        raise RunnerConfigError("工作目录不能是值班台系统根本身。")
+    try:
+        workspace_policy.validate_target(workdir, project_root, work_mode)
+    except ValueError as exc:
+        raise RunnerConfigError(str(exc)) from exc
+    if work_mode == workspace_policy.SELF:
+        return project_root.resolve()
     collab = project_root / "协作"
     if _is_within(workdir, collab):
         raise RunnerConfigError("工作目录不能位于 协作/ 或其子目录。")
@@ -381,6 +405,9 @@ class Runner:
         self.history_path = self.dispatch_dir / "runner.history.jsonl"
 
         self._mutex = threading.RLock()
+        self._result_ready = threading.Condition(self._mutex)
+        self._results: Dict[str, Dict[str, Any]] = {}
+        self._closed = False
         self._launch_mutex = threading.Lock()
         self._active: Optional[_ActiveRun] = None
         self._registration: Optional[_ActiveRun] = None
@@ -445,6 +472,7 @@ class Runner:
             "started": str(mapping.get("started") or ""),
             "started_epoch": _as_float(mapping.get("started_epoch")),
             "token": str(mapping.get("token") or ""),
+            "mode": str(mapping.get("mode") or ""),
             "path": self._display_path(self.lock_path),
         }
 
@@ -457,6 +485,19 @@ class Runner:
 
         info: Dict[str, Any] = dict(status)
         if running:
+            # Registration intentionally does not overwrite runner.status.
+            # A different lock identity must not inherit the previous run's fields.
+            if (str(info.get("task") or "") != str(lock.get("task") or "")
+                    or _as_int(info.get("pid")) != lock.get("agent_pid")):
+                info = {
+                    "task": lock.get("task", ""),
+                    "agent": lock.get("agent", ""),
+                    "started": lock.get("started", ""),
+                    "started_epoch": lock.get("started_epoch"),
+                    "pid": lock.get("agent_pid") or lock.get("owner_pid"),
+                    "owner_pid": lock.get("owner_pid"),
+                    "kind": "registration" if lock.get("mode") == "registration" else "run",
+                }
             info["state"] = "running"
             if not info.get("task"):
                 info["task"] = lock.get("task", "")
@@ -518,6 +559,7 @@ class Runner:
         log_prefix: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         cwd: Optional[Path] = None,
+        work_mode: str = workspace_policy.ISOLATED,
     ) -> Dict[str, Any]:
         """先抢锁并启动子进程；监视线程在后台收尾。
 
@@ -579,6 +621,7 @@ class Runner:
         workdir_path = _prepare_workdir(
             Path(workdir) if workdir is not None else task_path / "工作区",
             self.project_root,
+            work_mode=work_mode,
         )
         cwd_path = workdir_path
         if cwd is not None:
@@ -602,11 +645,14 @@ class Runner:
                 desk_root=self.project_root,
                 task_dir=task_path,
                 workdir=workdir_path,
+                work_mode=work_mode,
             )
         )
         argv = build_argv(agent, prompt_text)
 
         with self._launch_mutex:
+            if self._closed:
+                raise RunnerError("执行器正在退出，不能再启动任务。")
             if self._active is not None or self._registration is not None:
                 raise RunnerBusy("已有任务在跑", self.snapshot())
             started_epoch = time.time()
@@ -788,7 +834,7 @@ class Runner:
                     self._active = None
                     self._idle.set()
                 raise RunnerError(f"执行器监视线程无法启动：{exc}") from exc
-            return self.snapshot()
+            return dict(running_status, running=True)
 
     # ------------------------------------------------------------------
     # 总控登记：与普通派发共用同一把全局锁，但使用独立日志、不写 /runs 历史
@@ -849,6 +895,8 @@ class Runner:
         argv = build_argv(agent, prompt)
 
         with self._launch_mutex:
+            if self._closed:
+                raise RunnerError("执行器正在退出，不能再启动登记。")
             if self._active is not None or self._registration is not None:
                 raise RunnerBusy("已有任务在跑", self.snapshot())
             started_epoch = time.time()
@@ -1175,7 +1223,30 @@ class Runner:
             with self._mutex:
                 if self._active is active:
                     self._active = None
+                self._remember_result(payload)
                 self._idle.set()
+
+    def _remember_result(self, payload: Dict[str, Any]) -> None:
+        """Publish an immutable result only after process/lock cleanup is complete."""
+        run_id = str(payload.get("run_id") or "")
+        if not run_id:
+            return
+        with self._result_ready:
+            self._results[run_id] = dict(payload)
+            while len(self._results) > 256:
+                self._results.pop(next(iter(self._results)))
+            self._result_ready.notify_all()
+
+    def wait_for_result(self, run_id: str, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """Wait for this instance's specific run, never the global latest status."""
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        with self._result_ready:
+            while run_id not in self._results:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._result_ready.wait(remaining)
+            return dict(self._results[run_id])
 
     # ------------------------------------------------------------------
     # 历史与日志
@@ -1278,7 +1349,7 @@ class Runner:
             log_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise RunnerError(f"无法创建日志目录：{exc}") from exc
-        stamp = _now().strftime("%Y%m%d-%H%M%S")
+        stamp = _now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex
         sequence = 1
         while True:
             suffix = "" if sequence == 1 else f"-{sequence}"
@@ -1304,6 +1375,15 @@ class Runner:
     # ------------------------------------------------------------------
 
     def _acquire_lock(self, values: Dict[str, object]) -> None:
+        try:
+            with file_guard(self.dispatch_dir / ".runner.guard.lock"):
+                self._acquire_lock_guarded(values)
+        except TimeoutError as exc:
+            raise RunnerBusy(str(exc)) from exc
+        except OSError as exc:
+            raise RunnerError(f"无法取得执行器事务锁：{exc}") from exc
+
+    def _acquire_lock_guarded(self, values: Dict[str, object]) -> None:
         try:
             self.dispatch_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -1368,6 +1448,14 @@ class Runner:
             pass
 
     def _release_lock(self, token: str) -> None:
+        try:
+            with file_guard(self.dispatch_dir / ".runner.guard.lock"):
+                self._release_lock_guarded(token)
+        except (OSError, TimeoutError):
+            # The owning process/agent identity still protects the unreleased lock.
+            pass
+
+    def _release_lock_guarded(self, token: str) -> None:
         try:
             mapping, stat = self._read_lock_file()
         except OSError:
@@ -1737,6 +1825,8 @@ class Runner:
 
     def shutdown(self) -> None:
         """服务正常退出时终止当前执行组，让锁与状态有明确收尾。"""
+        with self._launch_mutex:
+            self._closed = True
         with self._mutex:
             active = self._active
             registration = self._registration
